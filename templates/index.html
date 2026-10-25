@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0a0d12"><title>Agent Skill Foundry</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=5">
 </head>
 <body>
   <div class="shell">
@@ -18,7 +18,7 @@
     </aside>
     <main class="main">
       <header class="topbar"><div><span class="eyebrow" id="page-eyebrow">WORKSPACE / CONVERSATION</span><h1 id="page-title">Chat</h1></div><div class="top-actions"><span class="local-badge"><span></span>LOCAL</span><button id="clear-chat" class="button button-quiet"><span>↺</span> Clear conversation</button></div></header>
-      <section id="config-banner" class="config-banner hidden" role="status"><span class="config-icon">!</span><div><strong>Finish setup to enable the agent</strong><p id="config-copy">Add provider credentials in .env.</p></div><code>new/.env</code></section>
+      <section id="config-banner" class="config-banner hidden" role="status"><span class="config-icon">!</span><div><strong>Set up your model provider</strong><p id="config-copy">Add an OpenAI-compatible endpoint, key, and model.</p></div><button class="button" id="open-settings">Configure</button></section>
       <section id="chat-view" class="view chat-view">
         <div id="messages" class="messages" aria-live="polite"><div class="welcome"><div class="welcome-glyph">✳</div><span class="eyebrow">YOUR CAPABILITY WORKSPACE</span><h2>What are we working on?</h2><p>Ask a question, use live web search, or put an approved skill to work. When a reusable capability is missing, we’ll shape one together.</p><div class="suggestions"><button data-prompt="Search the web for the latest Python 3.14 release notes and cite your sources."><span>↗</span> Search current information</button><button data-prompt="Help me make a reusable capability for a task I do often."><span>✳</span> Build a reusable skill</button></div></div></div>
         <div id="draft-host"></div>
@@ -28,6 +28,7 @@
       <footer class="app-footer"><span>AGENT SKILL FOUNDRY <span class="footer-sep">/</span> LOCAL FIRST</span><span>SKILLS ARE SAVED <span class="footer-sep">·</span> CHAT IS VOLATILE</span></footer>
     </main>
   </div>
-  <script src="/static/app.js" defer></script>
+  <dialog id="settings-dialog" class="settings-dialog"><form id="settings-form"><div class="library-heading"><div><span class="eyebrow">MODEL PROVIDER</span><h2>Connection settings</h2></div><button type="button" id="close-settings" class="button">Close</button></div><p class="subtle">Use any endpoint that implements the OpenAI Chat Completions API.</p><div class="field"><label for="provider-url">Base URL</label><input id="provider-url" type="url" placeholder="https://api.openai.com/v1" required></div><div class="field"><label for="provider-key">API key</label><input id="provider-key" type="password" placeholder="Saved locally in .env" autocomplete="new-password"></div><div class="field"><label for="provider-model">Model name</label><input id="provider-model" placeholder="gpt-4o-mini" required></div><p id="settings-result" class="subtle"></p><button class="button button-primary" type="submit">Save and connect</button></form></dialog>
+  <script src="/static/app.js?v=7" defer></script>
 </body>
 </html>

@@ -22,7 +22,7 @@ load_dotenv(ROOT / ".env")
 import uvicorn
 
 if not (ROOT / ".env").exists():
-    print("Setup: copy .env.example to .env and add GROQ_API_KEY, TAVILY_API_KEY, and LLM_MODEL.")
+    print("Setup: configure an OpenAI-compatible base URL, API key, and model in the app Settings.")
 print("Agent Skill Foundry: http://127.0.0.1:8000")
 print("Press Ctrl+C to stop.")
 uvicorn.run("app:app", host="127.0.0.1", port=int(os.getenv("PORT", "8000")), reload=False)

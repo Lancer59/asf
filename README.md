@@ -13,11 +13,11 @@ py -3.12 -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-# Edit .env and set GROQ_API_KEY, TAVILY_API_KEY, and a tool-calling LLM_MODEL
+# Configure the endpoint URL, API key, and model in the app Settings
 python run.py
 ```
 
-Open http://127.0.0.1:8000. The Skills library and setup screen work without credentials; chat and web search require both keys. `LLM_MODEL` defaults to `llama-3.3-70b-versatile`. Groq model availability can change; choose a currently supported tool-calling model in your account. Never commit `.env`.
+Open http://127.0.0.1:8000. The Skills library and chat UI work without credentials. Configure any OpenAI-compatible Chat Completions endpoint, API key, and model from Settings; credentials are stored in the local `.env`. Web search is optional and requires `TAVILY_API_KEY`. Never commit `.env`.
 
 If you use `uv`, `uv sync` creates `.venv`, then copy `.env.example` to `.env` and start with `uv run python run.py`. `requirements.in` is the human-maintained dependency input and `requirements.txt` is its pip-compatible install output. Regenerate it after package changes with `pip-compile requirements.in -o requirements.txt` when PyPI is reachable.
 
@@ -52,4 +52,4 @@ The research comparison should run the same fixed task set against (A) the basel
 
 - [Deep Agents overview](https://docs.langchain.com/oss/python/deepagents/overview) and [skills format](https://docs.langchain.com/oss/python/deepagents/skills)
 - [LangChain Tavily Search](https://docs.langchain.com/oss/python/integrations/tools/tavily_search)
-- [LangChain ChatGroq](https://docs.langchain.com/oss/python/integrations/chat/groq)
+- [LangChain ChatOpenAI](https://docs.langchain.com/oss/python/integrations/chat/openai)

@@ -1,5 +1,5 @@
 deepagents>=0.3
-langchain-groq>=0.3
+langchain-openai>=0.3
 langchain-tavily>=0.2
 fastapi>=0.115
 uvicorn[standard]>=0.30

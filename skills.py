@@ -57,12 +57,14 @@ def connect() -> sqlite3.Connection:
 
 
 def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:60]
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower())[:60].strip("-")
     return slug or "skill-" + uuid.uuid4().hex[:8]
 
 
 def skill_doc(skill: dict) -> str:
-    front = {"name": skill["name"], "description": skill["description"]}
+    # Agent Skills frontmatter names are identifiers, while ASF keeps the
+    # original human-friendly name in its library and UI.
+    front = {"name": slugify(skill["name"]), "description": skill["description"]}
     return "---\n" + yaml.safe_dump(front, sort_keys=False).strip() + "\n---\n\n" + (skill.get("instructions") or "") + "\n"
 
 
@@ -99,13 +101,15 @@ def audit(slug: str | None, action: str, detail: dict) -> None:
 
 
 def propose_skill(task: str, candidate: dict | None = None) -> dict:
-    skill = candidate or {
+    skill = dict(candidate) if candidate else {
         "name": "New reusable capability", "description": "A reusable capability proposed from the current task.",
         "skill_type": "instruction", "instructions": f"\nDefine a repeatable process for: {task}\nKeep request-specific values as inputs.",
         "code": "", "inputs": {"user_input": {"type": "string", "default": ""}}, "expected_output": "A useful result for the supplied input.",
         "dependencies": [], "permissions": [], "tags": [], "category": "general",
         "tests": [{"name": "Original task", "inputs": {"user_input": task}, "expected": ""}], "tools": []
     }
+    skill.setdefault("name", "New reusable capability")
+    skill.setdefault("description", f"A reusable capability for: {task}")
     skill.setdefault("skill_type", "instruction")
     skill.setdefault("code", "")
     skill.setdefault("instructions", "")
@@ -122,7 +126,7 @@ def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
         return {"success": False, "error": "No Python source provided.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": ""}
     docker = shutil.which("docker")
     if not docker:
-        return {"success": False, "error": "Docker is unavailable. Enable Docker Desktop to run Python skill tests; host execution is disabled.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": hashlib.sha256(code.encode()).hexdigest()}
+        return {"success": False, "status": "sandbox_unavailable", "error": "Docker is not installed. Install and start Docker Desktop to run Python skill tests; skill code is never executed directly on the host.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": hashlib.sha256(code.encode()).hexdigest()}
     source_hash = hashlib.sha256(code.encode()).hexdigest()
     start = time.monotonic()
     sandbox_root = ROOT / "data" / "sandbox"
@@ -131,7 +135,17 @@ def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
         work = Path(folder)
         (work / "skill.py").write_text(code, encoding="utf-8")
         (work / "inputs.json").write_text(json.dumps(inputs), encoding="utf-8")
-        runner = "import json,runpy; ns=runpy.run_path('/work/skill.py'); inputs=json.load(open('/work/inputs.json')); print(json.dumps(ns.get('run',lambda inputs: ns.get('result'))(inputs)))"
+        runner = """import contextlib, io, json, runpy
+ns = runpy.run_path('/work/skill.py')
+inputs = json.load(open('/work/inputs.json'))
+captured_out, captured_err = io.StringIO(), io.StringIO()
+try:
+    with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+        value = ns.get('run', lambda data: ns.get('result'))(inputs)
+    envelope = {'result': value, 'user_stdout': captured_out.getvalue(), 'user_stderr': captured_err.getvalue()}
+except Exception as exc:
+    envelope = {'result': None, 'user_stdout': captured_out.getvalue(), 'user_stderr': captured_err.getvalue(), 'exception': f'{type(exc).__name__}: {exc}'}
+print(json.dumps(envelope, default=str))"""
         command = [docker, "run", "--rm", "--network", "none", "--read-only", "--user", "65534:65534",
                    "--memory", "128m", "--cpus", "0.5", "--pids-limit", "32", "--cap-drop", "ALL",
                    "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
@@ -139,11 +153,31 @@ def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
         try:
             proc = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
             stdout, stderr, code_exit = proc.stdout[:MAX_OUTPUT], proc.stderr[:MAX_OUTPUT], proc.returncode
-            result = {"success": code_exit == 0, "stdout": stdout, "stderr": stderr, "exit_code": code_exit,
-                      "error": None if code_exit == 0 else (stderr or f"Sandbox exited with status {code_exit}"),
+            lower_error = stderr.lower()
+            engine_unavailable = code_exit != 0 and ("docker api" in lower_error or "dockerdesktoplinuxengine" in lower_error or "cannot connect to the docker daemon" in lower_error)
+            returned = None
+            user_stdout = user_stderr = ""
+            runtime_error = None
+            if code_exit == 0:
+                try:
+                    envelope = json.loads(stdout)
+                    returned = envelope.get("result")
+                    user_stdout = envelope.get("user_stdout", "")
+                    user_stderr = envelope.get("user_stderr", "")
+                    runtime_error = envelope.get("exception")
+                    stdout = user_stdout
+                    if runtime_error:
+                        code_exit = 1
+                        stderr = runtime_error
+                except (json.JSONDecodeError, AttributeError):
+                    returned = None
+            result = {"success": code_exit == 0, "status": "passed" if code_exit == 0 else "sandbox_unavailable" if engine_unavailable else "failed",
+                      "inputs": inputs, "return_value": returned, "stdout": stdout, "stderr": stderr,
+                      "user_stderr": user_stderr, "exit_code": code_exit,
+                      "error": None if code_exit == 0 else ("The Docker command is installed, but its engine is not running. Start Docker Desktop, wait until its engine is ready, then run the test again. The skill code was not executed." if engine_unavailable else (stderr or f"Sandbox exited with status {code_exit}")),
                       "duration_ms": int((time.monotonic()-start)*1000), "source_hash": source_hash}
         except subprocess.TimeoutExpired as exc:
-            result = {"success": False, "stdout": (exc.stdout or "")[:MAX_OUTPUT], "stderr": (exc.stderr or "")[:MAX_OUTPUT],
+            result = {"success": False, "status": "timeout", "stdout": (exc.stdout or "")[:MAX_OUTPUT], "stderr": (exc.stderr or "")[:MAX_OUTPUT],
                       "exit_code": None, "error": "Sandbox timed out after 15 seconds.", "duration_ms": 15000, "source_hash": source_hash}
     with connect() as conn:
         conn.execute("INSERT INTO executions(slug,source_hash,success,output,error,duration_ms,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -201,4 +235,15 @@ def deprecate(slug: str) -> dict | None:
 
 
 def approved_skill_directories() -> list[str]:
-    return [str(p) for p in APPROVED.glob("*/SKILL.md") if get_skill(p.parent.name) and get_skill(p.parent.name)["status"] == "approved"]
+    return ["/skills/approved/"] if approved_skill_files() else []
+
+
+def approved_skill_files() -> dict[str, str]:
+    """Expose only approved SKILL.md instructions through the virtual backend."""
+    files: dict[str, str] = {}
+    for skill_md in APPROVED.glob("*/SKILL.md"):
+        record = get_skill(skill_md.parent.name)
+        if record and record["status"] == "approved":
+            virtual_path = "/skills/approved/" + skill_md.parent.name + "/SKILL.md"
+            files[virtual_path] = {"content": skill_md.read_text(encoding="utf-8"), "encoding": "utf-8"}
+    return files

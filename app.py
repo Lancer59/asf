@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
+import asyncio
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +25,20 @@ app = FastAPI(title="Agent Skill Foundry", version="0.1.0")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=ROOT / "templates")
 MESSAGES: list[dict] = []
+
+
+def _has_matching_approved_skill(text: str) -> bool:
+    terms = set(re.findall(r"[a-z0-9]+", text.lower()))
+    for item in skills.list_skills(status="approved"):
+        metadata = item.get("metadata", {})
+        skill_terms = set(re.findall(r"[a-z0-9]+", " ".join([
+            item.get("name", ""), *metadata.get("tags", [])
+        ]).lower()))
+        # One distinctive domain tag (e.g. "json") is enough to avoid
+        # repeatedly offering a skill the user has already approved.
+        if terms & skill_terms:
+            return True
+    return False
 
 
 class ChatInput(BaseModel):
@@ -45,15 +61,44 @@ class EditInput(BaseModel):
     content: dict
 
 
+class ProviderConfig(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model: str
+
+
 @app.get("/")
 def home(request: Request):
-    return templates.TemplateResponse(request, "index.html", {"configured": bool(os.getenv("GROQ_API_KEY") and os.getenv("TAVILY_API_KEY"))})
+    return templates.TemplateResponse(request, "index.html", {"configured": bool(os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("GROQ_API_KEY"))})
 
 
 @app.get("/api/config")
 def configuration():
-    return {"llm_configured": bool(os.getenv("GROQ_API_KEY")), "search_configured": bool(os.getenv("TAVILY_API_KEY")),
-            "model": os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"), "docker_available": bool(__import__("shutil").which("docker"))}
+    return {"llm_configured": bool(os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("GROQ_API_KEY")), "search_configured": bool(os.getenv("TAVILY_API_KEY")),
+            "base_url": os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL", "https://api.openai.com/v1"),
+            "model": os.getenv("LLM_MODEL", "gpt-4o-mini"), "docker_available": bool(__import__("shutil").which("docker"))}
+
+
+@app.put("/api/config/provider")
+def save_provider_config(payload: ProviderConfig):
+    base_url = payload.base_url.strip().rstrip("/")
+    model_name = payload.model.strip()
+    if not base_url.startswith(("https://", "http://")) or not model_name:
+        raise HTTPException(422, "Enter a valid http(s) endpoint URL and model name")
+    api_key = payload.api_key.strip() or os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(422, "Enter an API key")
+    env_path = ROOT / ".env"
+    values = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                values[key.strip()] = value
+    values.update({"OPENAI_BASE_URL": base_url, "OPENAI_API_KEY": api_key, "LLM_MODEL": model_name})
+    env_path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+    os.environ.update({"OPENAI_BASE_URL": base_url, "OPENAI_API_KEY": api_key, "LLM_MODEL": model_name})
+    return {"ok": True, "llm_configured": True, "base_url": base_url, "model": model_name}
 
 
 @app.get("/api/skills")
@@ -77,26 +122,36 @@ def chat_stream(payload: ChatInput):
     MESSAGES.append({"role": "user", "content": text})
     # Keep exactly one volatile, bounded process-local conversation.
     del MESSAGES[:-20]
-    result = agent.invoke_agent(text, MESSAGES[:-1])
-    if result.get("error"):
-        reply = result["error"]
-    else:
+    async def stream():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def emit(event):
+            await queue.put(event)
+
+        task = asyncio.create_task(agent.stream_agent(text, MESSAGES[:-1], emit))
+        while not task.done() or not queue.empty():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.15)
+                yield "data: " + json.dumps(event, ensure_ascii=False, default=str) + "\n\n"
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+        result = await task
         reply = result.get("reply", "")
-    if not result.get("error"):
+        created_draft = None
         for step in result.get("steps", []):
-            calls = step.get("tool_calls", []) if isinstance(step, dict) else []
-            for call in calls:
-                if call.get("name") == "propose_reusable_skill":
-                    args = call.get("args", {})
-                    task = args.get("task", text)
-                    draft = next((d for d in skills.DRAFTS.values() if d.get("request") == task), None)
-                    if draft:
-                        result["draft"] = draft
-    MESSAGES.append({"role": "assistant", "content": reply})
-    event = {"type": "done", "reply": reply, "steps": result.get("steps", []), "error": result.get("error"), "draft": result.get("draft")}
-    def stream():
-        yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
-    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+            if step.get("type") == "tool_start" and step.get("name") == "propose_reusable_skill":
+                args = step.get("input", {})
+                task_text = args.get("task", text) if isinstance(args, dict) else text
+                draft = next((d for d in skills.DRAFTS.values() if d.get("request") == task_text), None)
+                if draft:
+                    created_draft = draft
+        if created_draft:
+            yield "data: " + json.dumps({"type": "draft", "draft": created_draft}, ensure_ascii=False, default=str) + "\n\n"
+        elif result.get("suggest_skill") and not _has_matching_approved_skill(" ".join(m.get("content", "") for m in MESSAGES[-6:])):
+            yield "data: " + json.dumps({"type": "skill_offer", "request": text}, ensure_ascii=False) + "\n\n"
+        MESSAGES.append({"role": "assistant", "content": reply})
+        yield "data: " + json.dumps({"type": "done", "reply": reply, "error": result.get("error")}, ensure_ascii=False) + "\n\n"
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/chat/clear")
@@ -107,7 +162,7 @@ def clear_chat():
 
 @app.post("/api/skills/drafts")
 def create_draft(payload: ChatInput):
-    return skills.propose_skill(payload.message)
+    return agent._skill_proposal(payload.message)
 
 
 @app.put("/api/skills/drafts/{draft_id}")
@@ -197,10 +252,10 @@ def revise_draft(draft_id: str, payload: ReviewInput):
         raise HTTPException(404, "Draft expired")
     if not payload.feedback.strip():
         raise HTTPException(422, "Feedback is required")
-    if not os.getenv("GROQ_API_KEY"):
-        raise HTTPException(503, "Configure GROQ_API_KEY to request an agent revision")
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("GROQ_API_KEY")):
+        raise HTTPException(503, "Configure an OpenAI-compatible provider in Settings to request an agent revision")
     try:
-        from langchain_groq import ChatGroq
+        from langchain_openai import ChatOpenAI
         from pydantic import BaseModel, Field
 
         class SkillRevision(BaseModel):
@@ -218,7 +273,10 @@ def revise_draft(draft_id: str, payload: ReviewInput):
             tests: list[dict]
             tools: list[str]
 
-        model = ChatGroq(model=os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"), temperature=0).with_structured_output(SkillRevision)
+        options = {"model": os.getenv("LLM_MODEL", "gpt-4o-mini"), "api_key": os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("GROQ_API_KEY"), "temperature": 0}
+        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL") or ("https://api.groq.com/openai/v1" if os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY") else None)
+        if base_url: options["base_url"] = base_url
+        model = ChatOpenAI(**options).with_structured_output(SkillRevision)
         revised = model.invoke("Revise the reusable skill based on feedback. Keep request values in inputs. "
             "Provide complete Python source only for python/hybrid types; keep all external permissions disabled unless explicitly asked. "
             f"Original task: {draft['request']}\nCurrent draft: {json.dumps(draft['skill'])}\nFeedback: {payload.feedback}")
