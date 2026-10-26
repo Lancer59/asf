@@ -171,6 +171,8 @@ print(json.dumps(envelope, default=str))"""
                         stderr = runtime_error
                 except (json.JSONDecodeError, AttributeError):
                     returned = None
+                    code_exit = 1
+                    stderr = "Sandbox returned an invalid result envelope."
             result = {"success": code_exit == 0, "status": "passed" if code_exit == 0 else "sandbox_unavailable" if engine_unavailable else "failed",
                       "inputs": inputs, "return_value": returned, "stdout": stdout, "stderr": stderr,
                       "user_stderr": user_stderr, "exit_code": code_exit,

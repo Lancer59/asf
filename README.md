@@ -21,6 +21,17 @@ Open http://127.0.0.1:8000. The Skills library and chat UI work without credenti
 
 If you use `uv`, `uv sync` creates `.venv`, then copy `.env.example` to `.env` and start with `uv run python run.py`. `requirements.in` is the human-maintained dependency input and `requirements.txt` is its pip-compatible install output. Regenerate it after package changes with `pip-compile requirements.in -o requirements.txt` when PyPI is reachable.
 
+## Automated tests
+
+Install the development dependencies and run the suite from the project root:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest -q
+```
+
+The tests cover provider configuration, chat and skill API behavior, draft review and approval, skill versioning and audit records, agent skill selection and progress labels, and Python sandbox outcomes. Tests use temporary SQLite databases and mock provider and Docker calls, so they do not need API credentials, a running model endpoint, web search, or Docker Engine. The app’s async event-stream generator should also be checked in CI or on a runner with a working asyncio event loop; the Windows development environment used for this suite can hang while initializing its socket pair.
+
 ## Skill lifecycle
 
 Chat can use the live Tavily web search integration, use approved Deep Agent skills, or produce a draft for review. Skills describe reusable capabilities; city, URL, date, topic and similar request data belong in inputs. Drafts live in process memory and disappear after a restart. Edit the fields and complete Python source, run tests, inspect test output and use explicit acceptance to promote a passing draft. Approval writes a versioned `SKILL.md` directory and an audit/version record to `data/skills.sqlite`. Editing an approved skill creates a new version. Deprecated skills remain in the audit trail and are withheld from the agent.

@@ -78,3 +78,15 @@ def test_tool_progress_labels_distinguish_skill_lookup_execution_and_drafts(monk
     assert agent.tool_event_label("propose_reusable_skill", "end") == "Skill draft prepared"
     assert agent.tool_event_label("run_approved_skill", "start", {"slug": "json-validator"}) == "Running JSON Validator in the sandbox"
     assert agent.tool_event_label("run_approved_skill", "end", '{"skill_name":"JSON Validator","success":true,"status":"passed"}') == "JSON Validator executed successfully · sandbox passed"
+
+
+def test_tool_progress_labels_cover_search_failure_and_sandbox_unavailable(monkeypatch):
+    monkeypatch.setattr(agent.skills, "get_skill", lambda slug: None)
+    assert agent.tool_event_label("web_search", "start") == "Searching the web"
+    assert agent.tool_event_label("web_search", "end") == "Search results received"
+    assert agent.tool_event_label("other", "start") == "Running a tool"
+    assert agent.tool_event_label("other", "end") == "Tool finished"
+    assert agent.tool_event_label("run_approved_skill", "end", '{"status":"sandbox_unavailable"}') == "Approved Skill was not run · sandbox unavailable"
+    assert agent.tool_event_label("run_approved_skill", "end", '{"success":false,"status":"failed"}') == "Approved Skill execution failed"
+
+
