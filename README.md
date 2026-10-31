@@ -30,7 +30,18 @@ python -m pip install -r requirements.txt
 python -m pytest -q
 ```
 
-The tests cover provider configuration, chat and skill API behavior, draft review and approval, skill versioning and audit records, agent skill selection and progress labels, and Python sandbox outcomes. Tests use temporary SQLite databases and mock provider and Docker calls, so they do not need API credentials, a running model endpoint, web search, or Docker Engine. The app’s async event-stream generator should also be checked in CI or on a runner with a working asyncio event loop; the Windows development environment used for this suite can hang while initializing its socket pair.
+The tests cover provider configuration, chat and skill API behavior, draft review and approval, skill versioning and audit records, agent skill selection and progress labels, and Python sandbox outcomes. Tests use temporary SQLite databases and mock provider and Docker calls, so the default suite does not need API credentials, a running model endpoint, web search, or Docker Engine. The default route checks exercise the SSE response contract without opening a local socket server.
+
+An opt-in live test starts the local app, sends a real request to the configured model, and verifies that the model calls the approved-skills tool and completes the SSE response. This also exercises actual async event streaming through HTTP. It can incur provider usage charges:
+
+```powershell
+$env:ASF_LIVE_TESTS = "1"
+python -m pytest -m live -q
+```
+
+In Windows Command Prompt (`cmd.exe`), use `set ASF_LIVE_TESTS=1` (no spaces around `=`), then run `python -m pytest -m live -q`.
+
+The live test reads credentials from the process environment or `.env`; it is skipped unless explicitly enabled. Remove the flag afterward with `Remove-Item Env:ASF_LIVE_TESTS`.
 
 ## Skill lifecycle
 

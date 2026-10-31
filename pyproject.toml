@@ -14,3 +14,4 @@ dev = ["pytest>=8.0", "httpx>=0.27"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live: opt-in tests that call the configured LLM provider"]
