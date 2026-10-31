@@ -111,6 +111,29 @@ def test_update_requires_passing_python_test_and_versions_changes(isolated_proje
     assert skills.update_skill("does-not-exist", {}) is None
 
 
+def test_update_uses_revision_test_inputs_for_validation_before_versioning(isolated_project, monkeypatch):
+    candidate = _candidate(skill_type="python")
+    candidate["tests"] = [{"name": "custom input", "inputs": {"json_text": "{}"}, "expected": {"valid": True}}]
+    draft = skills.propose_skill("seed", candidate)
+    monkeypatch.setattr(skills, "test_code", lambda *args, **kwargs: {"success": True, "status": "passed"})
+    skills.promote(draft)
+
+    seen = []
+    def passing_test(_code, inputs, *_args, **_kwargs):
+        seen.append(inputs)
+        return {"success": True, "status": "passed"}
+
+    monkeypatch.setattr(skills, "test_code", passing_test)
+    revision_inputs = {"json_text": '{"active":true}'}
+    revised = skills.update_skill(
+        "json-validator", {"code": "def run(inputs): return {'valid': True}"}, inputs=revision_inputs,
+    )
+
+    assert revised["status"] == "approved"
+    assert revised["skill"]["version"] == 2
+    assert seen == [revision_inputs]
+
+
 def test_deprecate_changes_status_and_audits(isolated_project):
     draft = skills.propose_skill("seed")
     draft["skill"] = _candidate()

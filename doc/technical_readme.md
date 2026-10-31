@@ -45,7 +45,7 @@ flowchart TD
 ### Runtime topology
 
 - One Uvicorn process binds to `127.0.0.1` by default; `PORT` changes the port.
-- Foundry and Runner conversation state and skill drafts are separate Python process globals. Each workspace is isolated from the other, but state is not session-scoped and is not shared between workers.
+- Foundry and Runner conversation state are separate Python process globals. Foundry tracks one active skill per conversation: one clarification round is allowed, then the draft occupies the right-hand review workspace. Starting another skill is blocked until Clear conversation removes the unapproved draft and resets session state. Approved skills remain in the library. State is local to the process and is not coordinated between multiple workers.
 - SQLite and skill files are local persistent state under the repository by default.
 - The browser makes same-origin requests to the FastAPI server. There is no separate frontend build or API gateway.
 - Provider requests leave the machine and go to the configured endpoint. Tavily requests leave the machine when search is enabled. Skill source is mounted into the local Docker container.
@@ -122,7 +122,7 @@ This topology is designed for a single local user. It currently has no authentic
 
 The Settings endpoint accepts a provider type, endpoint, API key, and model/deployment name. It requires an `http://` or `https://` URL, non-empty model, and key (the active provider's existing key may be reused if the submitted key is blank). OpenAI-compatible settings write `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `LLM_MODEL`; Azure settings write the separate `AZURE_OPENAI_*` variables. Selecting one profile does not overwrite the other profile's credentials. Both are saved in the project `.env` and take effect in the running process immediately. The endpoint does not make a test request to verify that credentials, endpoint, API version, and deployment work together.
 
-OpenAI-compatible providers use `ChatOpenAI`; Azure dated API versions use `AzureChatOpenAI`. Setting Azure API version to `v1` uses `ChatOpenAI` with `{AZURE_OPENAI_ENDPOINT}/openai/v1` and the deployment name as its model identifier. GPT-5 Azure requests use `max_completion_tokens` and omit `temperature`; the token ceiling uses `LLM_MAX_TOKENS`. A dated API version that predates this parameter may be rejected by the endpoint, so select an API version supported by the deployment or `v1`. Model/API compatibility, tool calling, context size, and structured output behavior are provider-dependent.
+OpenAI-compatible providers use `ChatOpenAI`; Azure dated API versions use `AzureChatOpenAI`. Setting Azure API version to `v1` uses `ChatOpenAI` with `{AZURE_OPENAI_ENDPOINT}/openai/v1` and the deployment name as its model identifier. GPT-5 Azure requests use `max_completion_tokens` and omit `temperature`; general calls use `LLM_MAX_TOKENS` and Foundry uses `ASF_SKILL_DRAFT_MAX_TOKENS` (default 2400) to leave enough output space for complete code skill proposals. A dated API version that predates this parameter may be rejected by the endpoint, so select an API version supported by the deployment or `v1`. Model/API compatibility, tool calling, context size, and structured output behavior are provider-dependent.
 
 `llm_provider.model_profiles()` uses validated entries from `ASF_MODELS` as the complete picker list (JSON, up to 100 profiles and 32 KiB). If it is unset or invalid, the two legacy environment profiles are used. IDs are unique and limited to alphanumeric characters plus `.`, `_`, and `-`; provider types are `openai_compatible` and `azure_openai`; endpoints must use HTTP or HTTPS. `api_key_env` names the environment variable containing the key. The config endpoint exposes IDs, labels, provider types, endpoint/model metadata, the key-variable name, and configured status, never key values. `PUT /api/config/model` rejects unknown or unconfigured profiles, then saves the selected ID to `.env` and process environment. The browser picker is disabled during a chat request and selects the profile used by the next chat and skill revision call. Updating catalog JSON requires an app restart; changing the active profile does not.
 
@@ -134,7 +134,7 @@ ASF uses Python's standard logging package through `observability.py`. It writes
 
 A pure ASGI middleware creates a fresh UUID request ID for each HTTP request, stores it in a context variable, logs request start and completion with method, path, status, and duration, and returns the ID in the `X-Request-ID` response header. Because the middleware wraps the full ASGI response call, the ID stays available while SSE response bodies are generated. Query strings and request bodies are excluded from access logs.
 
-Application events include provider configuration changes (model and endpoint host only), agent start/end status and duration, each model-call status/duration and provider-reported prompt/completion/total tokens, tool start/end status and duration, sandbox availability and outcomes, source hash and duration for Python tests, draft review states, skill approvals/version numbers, deprecation, and audit actions. The dashboard aggregates HTTP request count/failures/average duration plus agent runs, model calls, per-tool run/failure counts, prompt/completion/total tokens, and calls without token usage across the full selected file; the table's row limit does not truncate these metrics. `ChatOpenAI(stream_usage=True)` requests usage for streaming responses; providers may omit it, so missing usage is marked unavailable and never estimated. Token cost is not calculated because prices vary by provider/model and are not supplied by the log event. API keys, prompts, user inputs, skill source, and raw tool outputs are not logged. Error paths log exception classes rather than exception messages to reduce the chance of logging provider or user data. The HTTP response may still contain a detailed error for the caller.
+Application events include provider configuration changes (model and endpoint host only), agent start/end status and duration, model-call status/duration and reported token counts, tool start/end status and duration, sandbox outcomes, draft lifecycle events, and audit actions. For debugging, the full Foundry system prompt, model inputs and outputs, user prompt/history, tool inputs/outputs, and detailed exceptions are logged. This may include credentials or other sensitive text supplied in a prompt or generated skill; keep `data/logs` private and redact logs before sharing. Draft diagnostics also log validation errors, the stored draft ID, and the app's lookup/SSE delivery status. The dashboard aggregates HTTP request count/failures/average duration plus agent runs, model calls, per-tool run/failure counts, prompt/completion/total tokens, and calls without token usage across the full selected file; the table's row limit does not truncate these metrics. `ChatOpenAI(stream_usage=True)` requests usage for streaming responses; providers may omit it, so missing usage is marked unavailable and never estimated. Token cost is not calculated because prices vary by provider/model and are not supplied by the log event.
 
 Use `LOG_LEVEL=DEBUG` for more detailed metadata, or `ASF_LOG_FILE=` to disable persistent logging while retaining console output. When investigating an issue, copy the `X-Request-ID` value from the browser's Network response headers and search for that ID in the log file or use the dashboard search field.
 
@@ -147,8 +147,8 @@ Use `LOG_LEVEL=DEBUG` for more detailed metadata, or `ASF_LOG_FILE=` to disable 
 3. The route returns a `text/event-stream` response. A background asyncio task runs `agent.stream_agent` while the response generator forwards queued events as SSE `data:` frames. A comment keepalive frame is emitted during periods with no event.
 4. `stream_agent` creates the matching role-specific agent for the request and supplies a small, trimmed recent history. Only Runner receives approved skill Markdown files.
 5. Deep Agents emits lifecycle events. The adapter forwards model text chunks, translates tool start/end into user-facing labels, and tracks the events for the final result.
-6. When the graph finishes, Foundry may emit a draft payload, appends the assistant reply to its own history, and emits a final `done` event. Runner emits its reply and activity to Runner's history only.
-7. The browser reads the response stream, renders tokens as they arrive, and retains activity events in an expandable panel attached to that assistant message.
+6. On successful proposal creation, the tool returns the stored draft ID. `stream_agent` extracts that ID; the app retrieves that exact ID from `skills.DRAFTS`, emits it as a draft payload, runs one critique, appends the assistant reply to Foundry history, and emits `done`. Runner emits its reply and activity to Runner's history only.
+7. The browser reads the response stream, renders tokens as they arrive, and retains activity events in an expandable panel attached to that assistant message. Foundry uses a two-pane layout: transcript and composer on the left, persistent draft editor, first-pass critique, tests, and revisions on the right. Narrow viewports stack the panes.
 
 The client implements a small Markdown renderer for headings, paragraphs, lists, fenced code, tables, emphasis, inline code, and links. Text and HTML-sensitive content are escaped before insertion. This is a purpose-built subset, not a full CommonMark implementation.
 
@@ -162,14 +162,19 @@ Frames are JSON objects following `data: <JSON>\n\n`. The current event types in
 | `progress` | `message`: high-level model activity such as thinking. |
 | `tool_start` | `name`, `label`, and optional tool `input`. |
 | `tool_end` | `name`, `label`, and clipped tool `output`. |
+| `draft_progress` | `fields`: proposal fields that have arrived as complete JSON values while the model streams its proposal tool call; partial or malformed field fragments are withheld. |
 | `error` | `message`: setup or runtime failure. |
 | `draft` | `draft`: newly prepared skill proposal for the review UI. |
+| `critique_start` | `draft_id`: the draft is visible; one automated test/critique pass is starting. |
+| `critique` | `draft_id`, test result, and a concise model critique based only on that result. |
 | `skill_offer` | `request`: repeatable task text offered for proposal creation. |
 | `done` | `reply` and optional `error`: end-of-request event. |
 
-Keepalives are SSE comment frames (`: keepalive`) and are not JSON events. The order is event-driven; a response may contain progress/tool events, text chunks, then a draft/offer and `done`.
+Keepalives are SSE comment frames (`: keepalive`) and are not JSON events. Complete proposal fields can appear in the right-hand workspace as `draft_progress` events while the model is still generating tool arguments. The server then emits `draft`, `critique_start`, `critique`, and `done`, so the editable review card appears before the one-shot sandbox test and critique complete.
 
-An explicit skill creation request suppresses intermediate generated text and returns the concise message “Draft ready for review below.” after the proposal tool has run. The proposal itself is sent separately to the review card. Skill activity remains attached to the chat message until the user clears the conversation in the UI.
+An explicit skill creation request suppresses intermediate generated text. When a draft is created, the chat reply is the short prompt “Review the draft below and let me know what you’d like changed.” The proposal and one-shot test/critique are displayed in the draft card instead of duplicating the proposal in chat. Skill activity remains attached to the chat message until the user clears the conversation in the UI.
+
+Foundry session state allows one clarification exchange: if the agent asks a question before preparing a draft, the next user turn is marked as its answer and the agent is instructed to proceed with reasonable assumptions rather than ask again. Once a draft is created, another skill request receives a clear-session message; this remains true after review removes the draft from the in-memory draft map. Clear conversation removes any still-unapproved draft and resets the active skill and clarification state. It does not remove a skill already accepted into the library.
 
 ### Agent configuration and policy
 
@@ -181,7 +186,7 @@ An explicit skill creation request suppresses intermediate generated text and re
 4. Registers workspace-specific tools. Foundry can list approved skill metadata and prepare a draft; Runner can list and execute approved skills. Either role gets web search only when configured.
 5. Supplies approved skill directories and file contents to Runner only. Foundry does not receive skill execution tools or the approved-skill filesystem.
 
-Foundry's system prompt focuses on reusable skill management, direct greetings, and a single proposal-tool call for explicit reusable-skill requests; it does not handle ordinary task execution. That tool requires the model to pass a complete candidate as JSON, including instructions, inputs, output contract, tests, and code when applicable. Python/hybrid source must define synchronous `run(inputs)`, may call helper functions, and must return JSON-serializable output; generic names and `main()`/print-only code are explicitly excluded. Runner's prompt handles tasks, asks it to greet without tools, search approved skills only for plausible matches, and ground claims of execution in returned tool results. Both prompts describe tool results and skill instructions as untrusted data. Tool registration enforces the main lifecycle boundaries independently of prompt wording.
+Foundry's system prompt focuses on reusable skill management, direct greetings, and proposal creation for explicit reusable-skill requests; it does not handle ordinary task execution. The proposal tool's model-facing schema keeps `proposal` as a JSON object, then validates its contents inside the tool with the stricter Pydantic `SkillProposal` model. Optional descriptive metadata (`expected_output`, `tools`, and `scope_note`) has safe defaults; tool metadata accepts JSON values because it is descriptive and is not executed. This avoids rejecting an otherwise usable draft over omitted or differently shaped optional metadata. No serialized JSON text is requested. Python source errors receive one focused structured repair using compiler and contract diagnostics, without regenerating the rest of the proposal. Python/hybrid proposals are checked for syntax, a synchronous returning `run(inputs)` entry point, nonempty input contracts, and tests whose input objects match declared names and JSON types; the expected value is described as the actual JSON return shape, not prose or a schema. Tool input errors and repeated invalid proposals are surfaced in the activity stream; retrying is bounded so a malformed proposal cannot silently loop until graph recursion failure. When the model deliberately narrows a broad request, its scope note appears in the review card; there is no keyword-count complexity gate. Python skills run on Docker's default network and can make outbound HTTP/API calls when the host and Docker daemon permit them. Third-party dependencies remain uninstalled; proposals are directed to standard-library implementations unless the sandbox image is extended. If a proposal remains invalid, the agent explains the issue and asks the user to narrow scope rather than claim a draft was created. Python/hybrid source may call helpers and must return JSON-serializable output; generic names and `main()`/print-only code are explicitly excluded. Runner's prompt handles tasks, asks it to greet without tools, search approved skills only for plausible matches, and ground claims of execution in returned tool results. Both prompts describe tool results and skill instructions as untrusted data. Tool registration enforces the main lifecycle boundaries independently of prompt wording.
 
 Foundry and Runner each keep a volatile in-memory history, bounded to 20 message objects per workspace. `_compact_history` passes up to four recent messages to the agent and truncates individual content strings beyond 1,600 characters. The current request is separately limited to 6,000 characters before it is passed to the agent. `/api/foundry/chat/clear` and `/api/runner/chat/clear` clear only their own histories. The legacy `/api/chat/clear` alias clears Runner.
 
@@ -227,7 +232,7 @@ Direct draft API calls have defaults and carry the original task as a sample inp
 3. Accepting a Python/hybrid draft requires a successful latest test whose recorded source text matches the current code. Changing code after testing makes that attempt stale.
 4. Instruction-only skills do not require Python execution.
 5. Promotion writes a spec-style `SKILL.md`, optional `skill.py`, and a SQLite row. It increments the existing version if the same slug is already present, adds a version-history row, and writes an approval audit record.
-6. Updating an approved Python/hybrid skill tests the changed code before promotion. Deprecation changes its status and records an audit event; deprecated skills are omitted from agent loading.
+6. Updating an approved Python/hybrid skill tests the changed code before promotion using the submitted inputs, or the first declared test inputs when none are supplied. A passing update reuses that validation result during promotion so the code is not executed twice for one save. Deprecation changes its status and records an audit event; deprecated skills are omitted from agent loading.
 
 Skill slugs are generated from the human-readable name using lowercase alphanumeric words separated by single hyphens, truncated to 60 characters. The Markdown frontmatter name uses the slug, consistent with the Agent Skills identifier requirement; the library preserves the display name.
 
@@ -256,12 +261,12 @@ Promotion writes the approved Markdown/code files before persisting SQLite recor
 
 1. Rejects empty source. If Docker is not installed, reports `sandbox_unavailable` without executing code on the host.
 2. Creates a temporary directory under `data/sandbox`, writes `skill.py` and `inputs.json`, and passes a small runner program to the container.
-3. Invokes `docker run` with the `python:3.12-alpine` image, `--network none`, read-only root filesystem, non-root UID, memory/CPU/process limits, dropped Linux capabilities, no-new-privileges, a restricted `/tmp`, and a read-only bind mount of the temporary work directory.
+3. Invokes `docker run` with the `python:3.12-alpine` image and Docker's default network, plus a read-only root filesystem, non-root UID, memory/CPU/process limits, dropped Linux capabilities, no-new-privileges, a restricted `/tmp`, and a read-only bind mount of the temporary work directory.
 4. Runs Python isolated mode (`-I`). The host checks syntax and requires a synchronous `run(inputs)` entry point. The container imports the skill file with `runpy`, loads JSON input, invokes `run(inputs)`, requires a non-`None` JSON-serializable return value, and captures user stdout and stderr separately from the runner envelope. `main()` and print-only code are rejected as skill entry points.
 5. Enforces a 15-second host-side subprocess timeout and clips captured output to `MAX_OUTPUT` (20,000 characters).
 6. Parses the runner JSON envelope, distinguishes the user's return value/prints from Docker/runner errors, hashes the source, and records the execution in SQLite when Docker invocation was attempted.
 
-The `--network none` setting applies to the container. Docker must already be installed and its daemon available. The base image must be present locally or Docker must be able to obtain it; image acquisition is managed by Docker outside the isolated container. The sandbox is a useful isolation boundary for this local prototype, but it has not undergone a formal security review and should not be treated as a hardened multi-tenant code execution service.
+The container uses Docker's default network, which permits outbound requests if Docker Desktop, host firewall rules, and network policy allow them. Python skills can therefore contact external APIs; they must still validate user-supplied URLs and avoid exposing credentials in outputs. Docker must already be installed and its daemon available. The base image must be present locally or Docker must be able to obtain it; image acquisition is managed by Docker outside the isolated container. The sandbox is a useful isolation boundary for this local prototype, but it has not undergone a formal security review and should not be treated as a hardened multi-tenant code execution service.
 
 ## 8. HTTP API surface
 
@@ -284,17 +289,25 @@ Payload models are declared in `app.py`. FastAPI/Pydantic performs JSON parsing 
 | `GET /api/skills?q=&status=` | List/filter skill records. |
 | `GET /api/skills/{slug}` | Return skill record, content, history, and audit entries. |
 | `PATCH /api/skills/{slug}` | Update content and create a new version after Python test passes when executable. |
+| `POST /api/skills/{slug}/agent-revision` | Generate an unsaved structured proposal from user feedback and the current/proposed content; skill name/slug identity is preserved. |
 | `POST /api/skills/{slug}/test` | Test executable source or return instruction-only ready status. |
 | `POST /api/skills/{slug}/deprecate` | Mark skill deprecated. |
 | `POST /api/skills/drafts` | Prepare a skill draft from `{message}`. |
 | `GET /api/skills/drafts/{draft_id}` | Fetch an in-memory draft. |
 | `PUT /api/skills/drafts/{draft_id}` | Update draft skill fields. |
 | `POST /api/skills/drafts/{draft_id}/test` | Test the current draft candidate and record attempt. |
+| `POST /api/skills/drafts/{draft_id}/critique` | Run one automatic first test and concise model critique for a visible draft. |
 | `POST /api/skills/drafts/{draft_id}/review` | Accept or reject; acceptance enforces test rules. Feedback returns `needs_revision`. |
 | `POST /api/skills/drafts/{draft_id}/revise` | Ask the configured model for structured changes using feedback; clears prior test attempts. |
 | `/docs` | FastAPI-generated interactive API documentation. |
 
 There is no API authentication or CSRF/session model. By default the server binds to loopback, but deployment beyond a trusted local machine requires additional controls.
+
+### Agent-assisted revision contract
+
+The skill detail UI sends `POST /api/skills/{slug}/agent-revision` with `{ "feedback": "...", "current_skill": null }`. For follow-up edits, `current_skill` contains the last proposed version. The route uses the existing structured revision schema, returns `{ "status": "revision_proposed", "skill": ..., "diff": ... }`, and always discards its temporary in-memory revision draft. The saved approved record is unchanged until the user applies the proposal.
+
+Applying a proposal uses `PATCH /api/skills/{slug}` with `{ "content": ..., "inputs": ... }`. The optional `inputs` object is used to validate executable revisions; if omitted, the first declared test case is used. Validation failure or sandbox unavailability returns without promotion. A passing result creates the next version while preserving the existing skill name/slug. Instruction-only revisions do not require Python execution.
 
 ## 9. Frontend behavior
 
@@ -303,10 +316,11 @@ There is no API authentication or CSRF/session model. By default the server bind
 - Sends JSON requests through a helper that converts non-2xx responses to UI errors.
 - Reads the SSE response body with `ReadableStream.getReader()` and a `TextDecoder`; it splits frames on blank lines and parses `data:` frames as JSON.
 - Appends streamed response text using the local Markdown formatter.
-- Displays model/tool activity in an expandable `<details>` panel on the relevant assistant response. Tool inputs and clipped outputs are rendered as escaped text.
+- Shows a small animated, accessible work-status bot while a response is being prepared; its short status text changes as progress and tool events arrive, then disappears when the answer completes (or remains with an error state on failure).
+- Displays model/tool activity in a collapsed-by-default expandable `<details>` panel on the relevant assistant response. Tool inputs and clipped outputs are rendered as escaped text, and verbose skill proposal payloads are summarized in the activity view.
 - Keep the selected model profile in sync through the shared configuration API and clear only their own server-side volatile transcript.
 
-Foundry additionally displays draft cards with editable fields, test input, test history, feedback/revision controls, reject, and accept actions, and provides the persistent skill library with search/status filters, details, test, edit, and deprecate actions. Runner has no lifecycle editor; it focuses on task chat, tool activity, and approved skill use.
+Foundry additionally displays draft cards with editable fields, test input, test history, feedback/revision controls, reject, and accept actions, and provides the persistent skill library with search/status filters, details, test, manual edit, agent edit, and deprecate actions. **Edit with agent** opens a focused chat in the skill detail view. Follow-up prompts revise the previous proposal; the UI shows changed fields as before/after diffs. Nothing is saved until the user applies the proposal. Python/hybrid revisions are validated with the displayed JSON inputs before the next version is written; a failed/unavailable validation leaves the approved version unchanged. Runner has no lifecycle editor; it focuses on task chat, tool activity, and approved skill use.
 
 The browser does not persist conversations in local storage, cookies, or SQLite. It retains current DOM state only until refresh/clear; drafts live server-side in memory until restart or disposition.
 
@@ -322,20 +336,20 @@ python -m pytest -q
 Current coverage is organized as follows:
 
 - `tests/test_agent.py`: history compaction, task/skill intent detection, derived skill names, complete JSON proposal transfer, callable JSON skill source, approved-skill execution delegation, progress labels, and OpenAI-compatible/Azure dated/v1 model setup.
-- `tests/test_app_routes.py`: OpenAI-compatible and Azure profile validation/persistence, separate credential preservation, home/config state, chat request validation/SSE response contract/history clearing, skill route errors, draft edit/test/review flows and acceptance gates.
-- `tests/test_skill_lifecycle.py`: proposal defaults, SQLite promotion, files/frontmatter, search, version history, failed/pass promotion, update, deprecation, audit details.
+- `tests/test_app_routes.py`: OpenAI-compatible and Azure profile validation/persistence, separate credential preservation, home/config state, chat request validation/SSE response contract/history clearing, skill route errors, draft edit/test/review flows and acceptance gates, plus agent revision proposal without persistence and preserved skill identity.
+- `tests/test_skill_lifecycle.py`: proposal defaults, SQLite promotion, files/frontmatter, search, version history, failed/pass promotion, update validation with selected inputs, deprecation, audit details.
 - `tests/test_skill_execution.py`: return values and captured prints, rejection of `main()`/print-only/`None`-returning code, empty/no-Docker/daemon-unavailable states, runtime exceptions, timeout, malformed runner envelope, restrictive Docker arguments, approved Markdown exposure, slug/frontmatter naming.
 - `tests/test_observability.py`: file logging format, request ID correlation, response header injection, lifecycle event coverage, and query-string exclusion.
 - `tests/test_log_dashboard.py`: newest-first log selection, generated-data warning and controls, reverse chronological parsing, full-file AI and per-tool metrics with truncated display rows, and rejection of unlisted paths.
 - `tests/conftest.py`: temporary project/database isolation and a direct endpoint-function adapter.
 - `tests/integration/test_live_chat.py`: opt-in real provider checks for a Foundry greeting without tools and a Runner request that calls `list_approved_skills`, receives its result, and returns a response.
 
-The default suite mocks provider and Docker subprocess boundaries; it requires neither credentials nor a live Docker daemon and uses temporary SQLite storage for lifecycle and execution-record checks. Its route tests call endpoint functions directly to avoid a Windows socket-based test client. The opt-in live suite makes a real provider request through ASF's production agent and requires provider credentials and network access; it may incur usage charges. Enable it with `$env:ASF_LIVE_TESTS = "1"` in PowerShell or `set ASF_LIVE_TESTS=1` in `cmd.exe`, then run `python -m pytest -m live -q`. The live test checks model-to-tool calling but does not run the HTTP SSE route. Latest offline verification: **69 tests passed, 2 opt-in live tests skipped** (`python -m pytest -q --basetemp=.pytest-tmp`). Python compilation, JavaScript syntax checks, and `git diff --check` also passed.
+The default suite mocks provider and Docker subprocess boundaries; it requires neither credentials nor a live Docker daemon and uses temporary SQLite storage for lifecycle and execution-record checks. Its route tests call endpoint functions directly to avoid a Windows socket-based test client. The opt-in live suite makes a real provider request through ASF's production agent and requires provider credentials and network access; it may incur usage charges. Enable it with `$env:ASF_LIVE_TESTS = "1"` in PowerShell or `set ASF_LIVE_TESTS=1` in `cmd.exe`, then run `python -m pytest -m live -q`. The live test checks model-to-tool calling but does not run the HTTP SSE route. Latest offline verification: **78 tests passed, 2 opt-in live tests skipped** (`python -m pytest -q --basetemp=data/pytest-tmp`).
 
 ## 11. Security, privacy, and operational boundaries
 
 - **Local credentials:** `.env` contains secrets and is ignored by Git. Provider keys are not returned by `/api/config`. The Settings form writes key material in plain text to `.env`; filesystem protections are therefore important.
-- **Network egress:** Model calls and optional Tavily searches contact external services. Python containers use `--network none`.
+- **Network egress:** Model calls, optional Tavily searches, and Python skills can contact external services. Python containers use Docker's default network; outbound access depends on local Docker and host network policy.
 - **Local-only by default:** Uvicorn binds to `127.0.0.1`. Do not expose the application on a shared network without authentication, TLS, request protections, rate limits, and an explicit threat review.
 - **Process state:** Chat messages and drafts are global and volatile. Multiple users or Uvicorn workers would have isolated but unsynchronized state.
 - **Skill trust:** Only reviewed/approved skill Markdown is loaded. Skill instructions and tool results remain untrusted input to the model. Python source runs only through Docker.
@@ -365,6 +379,6 @@ The current implementation intentionally favors a small, inspectable local appli
 | Search | Optional Tavily tool. | Current web research when configured; external key and network dependency. |
 | Skill storage | SQLite records plus Agent Skills Markdown/code folders. | Human-readable instructions and queryable history; filesystem/DB consistency must be managed. |
 | Chat/draft persistence | Process memory. | No transcript retention and easy local operation; restart loss and no session isolation. |
-| Python execution | Docker container, no container network, constrained mounts/resources. | Avoids host-process execution; requires Docker and is not a fully hardened hosted sandbox. |
+| Python execution | Docker container with default network, constrained mounts/resources. | Enables API integrations while keeping source off the host process; outbound access is host-dependent and the sandbox is not fully hardened. |
 | Retrieval | Metadata and substring matching. | Transparent and dependency-light; weaker recall/precision than semantic retrieval. |
 

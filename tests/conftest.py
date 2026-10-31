@@ -32,10 +32,16 @@ def isolated_project(tmp_path, monkeypatch):
     skills.DRAFTS.clear()
     app.FOUNDRY_MESSAGES.clear()
     app.RUNNER_MESSAGES.clear()
+    app.FOUNDRY_ACTIVE_DRAFT_ID = None
+    app.FOUNDRY_SESSION_SKILL_NAME = None
+    app.FOUNDRY_PENDING_CLARIFICATION = False
     yield tmp_path
     skills.DRAFTS.clear()
     app.FOUNDRY_MESSAGES.clear()
     app.RUNNER_MESSAGES.clear()
+    app.FOUNDRY_ACTIVE_DRAFT_ID = None
+    app.FOUNDRY_SESSION_SKILL_NAME = None
+    app.FOUNDRY_PENDING_CLARIFICATION = False
 
 
 @pytest.fixture
@@ -113,6 +119,8 @@ def client(isolated_project):
                     result = app.review_draft(path.split("/")[4], app.ReviewInput.model_validate(body))
                 elif method == "POST" and path.endswith("/revise"):
                     result = app.revise_draft(path.split("/")[4], app.ReviewInput.model_validate(body))
+                elif method == "POST" and path.endswith("/agent-revision"):
+                    result = app.revise_approved_skill(path.split("/")[3], app.AgentRevisionInput.model_validate(body))
                 elif method == "POST" and path.endswith("/deprecate"):
                     result = app.deprecate_skill(path.split("/")[3])
                 elif method == "POST" and path.startswith("/api/skills/") and path.endswith("/test"):

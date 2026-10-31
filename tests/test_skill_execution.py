@@ -79,7 +79,7 @@ def test_test_code_reports_runtime_exception_separately_from_container_failure(m
     runner_result = {"result": None, "user_stdout": "before crash\n", "user_stderr": "warning\n", "exception": "ValueError: invalid input"}
     monkeypatch.setattr(skills.shutil, "which", lambda _: "docker")
     monkeypatch.setattr(skills.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0, json.dumps(runner_result), ""))
-    result = skills.test_code("def run(inputs): raise ValueError()", {"x": 1})
+    result = skills.test_code("def run(inputs):\n    raise ValueError()\n    return {'ok': True}", {"x": 1})
     assert result["success"] is False
     assert result["status"] == "failed"
     assert result["exit_code"] == 1
@@ -118,7 +118,7 @@ def test_test_code_rejects_non_json_runner_output(monkeypatch, isolated_project)
     assert result["return_value"] is None
 
 
-def test_test_code_uses_network_isolated_restricted_docker_command(monkeypatch, isolated_project):
+def test_test_code_uses_default_network_and_restricted_docker_command(monkeypatch, isolated_project):
     calls = {}
     monkeypatch.setattr(skills.shutil, "which", lambda _: "docker.exe")
     def run(args, **kwargs):
@@ -129,8 +129,10 @@ def test_test_code_uses_network_isolated_restricted_docker_command(monkeypatch, 
     command = calls["args"]
     assert result["success"] is True
     assert command[:3] == ["docker.exe", "run", "--rm"]
-    for option in ("--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "32"):
+    for option in ("--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "32"):
         assert option in command
+    assert "--network" not in command
+    assert "none" not in command
     assert calls["kwargs"]["timeout"] == 15
     assert calls["kwargs"]["check"] is False
 

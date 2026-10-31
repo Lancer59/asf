@@ -222,6 +222,8 @@ def test_foundry_and_runner_have_separate_pages_histories_and_clear_routes(clien
     assert foundry.status_code == 200 and "Skill Foundry" in foundry.text
     assert runner.status_code == 200 and "Skill Runner" in runner.text
     assert "draft-host" in foundry.text
+    assert 'class="foundry-layout"' in foundry.text
+    assert "Clear conversation to start another skill" in foundry.text
     assert "draft-host" not in runner.text
 
     assert client.post("/api/foundry/chat/stream", json={"message": "Create a skill"}).status_code == 200
@@ -234,6 +236,36 @@ def test_foundry_and_runner_have_separate_pages_histories_and_clear_routes(clien
     assert [item["content"] for item in app.RUNNER_MESSAGES] == ["Calculate 2 + 2"]
     assert client.post("/api/runner/chat/clear").json() == {"ok": True}
     assert app.RUNNER_MESSAGES == []
+
+
+def test_clearing_foundry_resets_active_skill_draft_and_clarification(client):
+    draft = skills.propose_skill("Create a test skill")
+    app.FOUNDRY_ACTIVE_DRAFT_ID = draft["id"]
+    app.FOUNDRY_PENDING_CLARIFICATION = True
+    app.FOUNDRY_MESSAGES.extend([{"role": "user", "content": "Create it"}])
+
+    assert client.post("/api/foundry/chat/clear").json() == {"ok": True}
+    assert app.FOUNDRY_MESSAGES == []
+    assert app.FOUNDRY_ACTIVE_DRAFT_ID is None
+    assert app.FOUNDRY_PENDING_CLARIFICATION is False
+    assert draft["id"] not in skills.DRAFTS
+
+
+def test_foundry_clarification_is_allowed_once_then_active_skill_requires_clear(client):
+    assert app._active_skill_session_reply("Create a date parsing skill") is None
+    app._record_foundry_clarification_result({"needs_clarification": True})
+    assert app.FOUNDRY_PENDING_CLARIFICATION is True
+
+    # A user reply during the clarification round is not blocked as a second skill.
+    assert app._active_skill_session_reply("Use Basic Auth") is None
+    app._record_foundry_clarification_result({"needs_clarification": False})
+    assert app.FOUNDRY_PENDING_CLARIFICATION is False
+
+    app.FOUNDRY_ACTIVE_DRAFT_ID = "already-reviewed"
+    app.FOUNDRY_SESSION_SKILL_NAME = "Date parser"
+    assert app._active_skill_session_reply("Create another skill") == (
+        "This conversation is focused on Date parser. Clear conversation to start another skill."
+    )
 
 
 def test_skills_routes_filter_and_return_not_found(client, monkeypatch):
@@ -317,6 +349,42 @@ def test_revision_schema_is_strict_compatible_and_restores_dynamic_inputs_and_te
     assert revised["skill_type"] == "python"
     assert revised["inputs"] == {"value": {"type": "integer"}}
     assert revised["tests"] == [{"name": "identity", "inputs": {"value": 3}, "expected": 3}]
+
+
+def test_agent_revision_of_approved_skill_returns_proposal_without_saving(client, monkeypatch):
+    original = skills.propose_skill("Create an HTTP helper")
+    original["skill"].update({"name": "HTTP Helper", "description": "Original description"})
+    approved = skills.promote(original)
+    slug = approved["skill"]["slug"]
+    monkeypatch.setattr(app.llm_provider, "provider_configured", lambda: True)
+    revised_payload = {
+        "name": "Renamed by model", "description": "Updated description", "skill_type": "instruction",
+        "instructions": "Send requests safely", "code": "", "inputs_json": '{"url":{"type":"string"}}',
+        "expected_output": "A response", "dependencies": [], "permissions": [], "tags": ["http"],
+        "category": "api", "tests_json": '[{"name":"status","inputs":{"url":"https://example.test"},"expected":"A response"}]',
+        "tools": [],
+    }
+
+    class FakeModel:
+        def with_structured_output(self, schema):
+            self.revision = schema(**revised_payload)
+            return self
+
+        def invoke(self, _prompt):
+            return self.revision
+
+    monkeypatch.setattr(app.llm_provider, "create_chat_model", lambda **_kwargs: FakeModel())
+    draft_ids_before = set(skills.DRAFTS)
+    response = client.post(f"/api/skills/{slug}/agent-revision", json={"feedback": "Update the response behavior"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "revision_proposed"
+    assert response.json()["skill"]["description"] == "Updated description"
+    assert response.json()["skill"]["name"] == "HTTP Helper"  # Preserve library identity.
+    unchanged = skills.get_skill(slug)
+    assert unchanged["version"] == 1
+    assert unchanged["content"]["description"] == "Original description"
+    assert set(skills.DRAFTS) == draft_ids_before
 
 
 def test_draft_python_test_requires_successful_current_source_before_accept(client, monkeypatch):

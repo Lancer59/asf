@@ -36,6 +36,19 @@ def test_explicit_skill_request_is_detected_for_compact_chat_reply():
     assert not agent._explicit_skill_request("Is this JSON valid?")
 
 
+def test_partial_proposal_stream_yields_only_complete_fields():
+    partial = '{"task":"Build a skill","proposal":{"name":"API Poster","description":"Send requests",'
+    assert agent._completed_proposal_fields(partial) == {"name": "API Poster", "description": "Send requests"}
+
+    nested = partial + '"inputs":{"url":{"type":"string"}},"tests":[{"name":"ok"}]'
+    assert agent._completed_proposal_fields(nested) == {
+        "name": "API Poster", "description": "Send requests",
+        "inputs": {"url": {"type": "string"}},
+    }
+    with_array = nested + ',"category":"api"'
+    assert agent._completed_proposal_fields(with_array)["tests"] == [{"name": "ok"}]
+
+
 def test_existing_approved_skill_suppresses_duplicate_offer(monkeypatch):
     monkeypatch.setattr(app.skills, "list_skills", lambda status="": [{
         "name": "JSON Validator", "description": "Validate JSON documents", "metadata": {"tags": ["json", "validation", "schema"]}
@@ -57,6 +70,34 @@ def test_json_skill_proposal_has_runnable_code_and_examples():
         assert "def run(inputs)" in skill["code"]
     finally:
         skills.DRAFTS.pop(draft["id"], None)
+
+
+def test_python_proposal_tests_match_run_inputs_and_return_shape():
+    proposal = agent.SkillProposal(
+        name="Post API", description="Send a post request", skill_type="python",
+        instructions="Accept URL and return a result object.",
+        code="def run(inputs):\n    return {'success': True, 'status_code': 200}",
+        inputs={
+            "url": {"type": "string", "required": True},
+            "timeout": {"type": "integer", "default": 30},
+        },
+        dependencies=[], permissions=[], tags=[], category="api",
+        tests=[{
+            "name": "successful request",
+            "inputs": {"url": "https://example.test"},
+            "expected": {"success": True, "status_code": 200},
+        }],
+    )
+    assert agent._proposal_issues(proposal) == []
+
+    proposal.tests = [{
+        "name": "bad input shape",
+        "inputs": {"url": {"type": "string"}, "undeclared": 1},
+        "expected": "success is true",
+    }]
+    issues = agent._proposal_issues(proposal)
+    assert any("input 'url' must be a JSON string" in issue for issue in issues)
+    assert any("undeclared names: undeclared" in issue for issue in issues)
 
 
 def test_reusable_skill_proposal_uses_request_specific_name_and_model_candidate():
@@ -343,7 +384,7 @@ def test_agent_tool_closures_list_skills_propose_once_and_reject_unapproved_exec
     agent.DRAFTS.clear()
     _, error = agent.create_agent("foundry")
     assert error is None
-    tools = {tool.__name__: tool for tool in captured["options"]["tools"]}
+    tools = {getattr(tool, "name", getattr(tool, "__name__", "")): tool for tool in captured["options"]["tools"]}
     assert json.loads(tools["list_approved_skills"]()) == [{
         "slug": "demo", "name": "Demo", "description": "A demo", "skill_type": "python", "inputs": {"x": {"type": "integer"}}, "expected_output": "", "instructions": "", "tags": ["sample"]
     }]
@@ -353,17 +394,38 @@ def test_agent_tool_closures_list_skills_propose_once_and_reject_unapproved_exec
         "instructions": "Input: value. Output: answer object.", "code": proposed_code,
         "inputs": {"value": {"type": "integer"}}, "expected_output": "An answer object.",
         "dependencies": [], "permissions": [], "tests": [{"name": "basic", "inputs": {"value": 3}, "expected": {"answer": 3}}],
-        "tags": ["demo"], "category": "testing", "tools": [],
+        "tags": ["demo"], "category": "testing", "tools": [], "scope_note": "",
     }
-    first = tools["propose_reusable_skill"]("Create one demo skill", json.dumps(proposal))
-    second = tools["propose_reusable_skill"]("This should not create another", json.dumps(proposal))
+    malformed = tools["propose_reusable_skill"].invoke({"task": "Create one demo skill", "proposal": {"name": "Incomplete"}})
+    assert "No draft was created" in malformed
+    assert "description" in malformed
+    assert not agent.DRAFTS
+    first = tools["propose_reusable_skill"].invoke({"task": "Create one demo skill", "proposal": proposal})
+    second = tools["propose_reusable_skill"].invoke({"task": "This should not create another", "proposal": proposal})
     assert "Draft created" in first
     assert "already created" in second
     assert len(agent.DRAFTS) == 1
     draft = next(iter(agent.DRAFTS.values()))
     assert draft["skill"]["code"] == proposed_code
     assert draft["skill"]["inputs"] == {"value": {"type": "integer"}}
-    assert "def run(inputs)" in captured["options"]["system_prompt"]
+    # Optional descriptive fields and free-form tool metadata must not block draft creation.
+    minimal_optional = dict(proposal)
+    minimal_optional.pop("expected_output")
+    minimal_optional["tools"] = ["HTTP POST"]
+    minimal_optional["inputs"] = [
+        {"name": key, **value} for key, value in proposal["inputs"].items()
+    ]
+    agent.DRAFTS.clear()
+    _, error = agent.create_agent("foundry")
+    assert error is None
+    fresh_tools = {getattr(tool, "name", getattr(tool, "__name__", "")): tool for tool in captured["options"]["tools"]}
+    optional_result = fresh_tools["propose_reusable_skill"].invoke({"task": "Create a POST capability", "proposal": minimal_optional})
+    assert "Draft created" in optional_result
+    optional_draft = next(iter(agent.DRAFTS.values()))
+    assert optional_draft["skill"]["expected_output"]
+    assert optional_draft["skill"]["tools"] == ["HTTP POST"]
+    assert optional_draft["skill"]["inputs"] == proposal["inputs"]
+    assert "run(inputs)" in captured["options"]["system_prompt"]
     assert "run_approved_skill" not in tools
     assert "Do not act as a general task assistant" in captured["options"]["system_prompt"]
     agent.DRAFTS.clear()
@@ -389,7 +451,7 @@ def test_foundry_and_runner_toolsets_are_separate(monkeypatch):
     _, error = agent.create_agent("foundry")
     assert error is None
     foundry = captured["options"]
-    foundry_tools = {tool.__name__ for tool in foundry["tools"]}
+    foundry_tools = {getattr(tool, "name", getattr(tool, "__name__", "")) for tool in foundry["tools"]}
     assert foundry_tools == {"list_approved_skills", "propose_reusable_skill"}
     assert foundry["skills"] == []
 
@@ -487,7 +549,82 @@ def test_agent_stream_logs_model_usage_and_tool_durations(monkeypatch):
     assert any("agent_model_call_finished" in line and "prompt_tokens=11" in line and "completion_tokens=5" in line for line in records)
     assert any("agent_tool_finished tool=test_tool status=success" in line and "duration_ms=" in line for line in records)
     assert any("agent_tool_finished tool=broken_tool status=error" in line and "error_type=ValueError" in line for line in records)
-    assert all("private detail" not in line for line in records)
+    assert any('error="private detail"' in line for line in records)
     assert any("agent_stream_finished workspace=runner status=success" in line and "model_calls=1" in line and "tool_runs=2" in line and "tool_failures=1" in line for line in records)
+
+
+def test_foundry_proposal_tool_errors_are_visible_and_bounded(monkeypatch):
+    emitted = []
+
+    async def emit(event):
+        emitted.append(event)
+
+    class FakeAgent:
+        async def astream_events(self, *_args, **_kwargs):
+            for run_id in ("t1", "t2", "t3"):
+                yield {"event": "on_tool_start", "run_id": run_id, "name": "propose_reusable_skill", "data": {"input": {"task": "make a skill"}}}
+                yield {"event": "on_tool_error", "run_id": run_id, "name": "propose_reusable_skill", "data": {"error": ValueError("private provider detail")}}
+
+    monkeypatch.setattr(agent, "create_agent", lambda workspace="foundry": (FakeAgent(), None))
+    coroutine = agent.stream_agent("create a reusable skill", [], emit, workspace="foundry")
+    try:
+        coroutine.send(None)
+    except StopIteration as completed:
+        result = completed.value
+    else:
+        raise AssertionError("Fake event stream unexpectedly suspended")
+
+    assert result["reply"].startswith("I couldn’t prepare the draft")
+    assert len([event for event in result["steps"] if event["type"] == "error"]) == 2
+    assert not any("private provider detail" in str(event) for event in emitted)
+    assert not any(event.get("name") == "propose_reusable_skill" and event.get("type") == "tool_end" for event in emitted)
+
+
+def test_foundry_agent_returns_the_confirmed_draft_id(monkeypatch):
+    draft_id = "a" * 32
+
+    async def emit(_event):
+        return None
+
+    class FakeAgent:
+        async def astream_events(self, *_args, **_kwargs):
+            yield {"event": "on_tool_start", "run_id": "t1", "name": "propose_reusable_skill", "data": {"input": {"task": "Create a skill"}}}
+            yield {"event": "on_tool_end", "run_id": "t1", "name": "propose_reusable_skill", "data": {"output": f"Draft created: Example (id {draft_id})."}}
+
+    monkeypatch.setattr(agent, "create_agent", lambda workspace="foundry": (FakeAgent(), None))
+    coroutine = agent.stream_agent("create a reusable skill", [], emit, workspace="foundry")
+    try:
+        coroutine.send(None)
+    except StopIteration as completed:
+        result = completed.value
+    else:
+        raise AssertionError("Fake event stream unexpectedly suspended")
+
+    assert result["created_draft_id"] == draft_id
+    assert result["reply"].startswith("Review the draft below")
+
+
+def test_foundry_model_uses_configured_skill_proposal_token_ceiling(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("ASF_SKILL_DRAFT_MAX_TOKENS", "2345")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options):
+            captured["model_options"] = options
+
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = lambda **options: "fake-agent"
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+
+    _, error = agent.create_agent("foundry")
+    assert error is None
+    assert captured["model_options"]["max_tokens"] == 2345
 
 

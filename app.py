@@ -39,6 +39,11 @@ app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=ROOT / "templates")
 FOUNDRY_MESSAGES: list[dict] = []
 RUNNER_MESSAGES: list[dict] = []
+# A Foundry transcript owns at most one active, unapproved draft. Clearing the
+# transcript resets this session state; approved skills remain in the library.
+FOUNDRY_ACTIVE_DRAFT_ID: str | None = None
+FOUNDRY_SESSION_SKILL_NAME: str | None = None
+FOUNDRY_PENDING_CLARIFICATION = False
 # Backward-compatible alias for the old generic chat endpoint, now Skill Runner.
 MESSAGES = RUNNER_MESSAGES
 
@@ -55,6 +60,18 @@ def _has_matching_approved_skill(text: str) -> bool:
         if terms & skill_terms:
             return True
     return False
+
+
+def _active_skill_session_reply(message: str) -> str | None:
+    if (FOUNDRY_ACTIVE_DRAFT_ID is None or FOUNDRY_PENDING_CLARIFICATION
+            or not agent._explicit_skill_request(message)):
+        return None
+    return f"This conversation is focused on {FOUNDRY_SESSION_SKILL_NAME or 'the current skill'}. Clear conversation to start another skill."
+
+
+def _record_foundry_clarification_result(result: dict) -> None:
+    global FOUNDRY_PENDING_CLARIFICATION
+    FOUNDRY_PENDING_CLARIFICATION = bool(result.get("needs_clarification"))
 
 
 class ChatInput(BaseModel):
@@ -75,6 +92,12 @@ class ReviewInput(BaseModel):
 
 class EditInput(BaseModel):
     content: dict
+    inputs: dict = Field(default_factory=dict)
+
+
+class AgentRevisionInput(BaseModel):
+    feedback: str
+    current_skill: dict | None = None
 
 
 class ProviderConfig(BaseModel):
@@ -474,20 +497,35 @@ def get_skill(slug: str):
 
 
 def _chat_stream(payload: ChatInput, workspace: str):
+    global FOUNDRY_ACTIVE_DRAFT_ID, FOUNDRY_SESSION_SKILL_NAME, FOUNDRY_PENDING_CLARIFICATION
     text = payload.message.strip()
     if not text:
         raise HTTPException(422, "Message cannot be empty")
     messages = FOUNDRY_MESSAGES if workspace == "foundry" else RUNNER_MESSAGES
+    if workspace == "foundry":
+        blocked_reply = _active_skill_session_reply(text)
+        if blocked_reply:
+            messages.append({"role": "user", "content": text})
+            reply = blocked_reply
+            messages.append({"role": "assistant", "content": reply})
+            async def blocked_stream():
+                yield "data: " + json.dumps({"type": "done", "reply": reply, "session_blocked": True}, ensure_ascii=False) + "\n\n"
+            return StreamingResponse(blocked_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     logger.info("chat_request_accepted workspace=%s message_chars=%s history_messages=%s", workspace, len(text), len(messages))
     messages.append({"role": "user", "content": text})
     del messages[:-20]
     async def stream():
+        global FOUNDRY_ACTIVE_DRAFT_ID, FOUNDRY_SESSION_SKILL_NAME, FOUNDRY_PENDING_CLARIFICATION
         queue: asyncio.Queue = asyncio.Queue()
 
         async def emit(event):
             await queue.put(event)
 
-        task = asyncio.create_task(agent.stream_agent(text, messages[:-1], emit, workspace=workspace))
+        continuation = workspace == "foundry" and FOUNDRY_PENDING_CLARIFICATION
+        task = asyncio.create_task(agent.stream_agent(
+            text, messages[:-1], emit, workspace=workspace,
+            clarification_already_used=continuation,
+        ))
         while not task.done() or not queue.empty():
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=0.15)
@@ -495,17 +533,30 @@ def _chat_stream(payload: ChatInput, workspace: str):
             except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
         result = await task
+        if workspace == "foundry":
+            _record_foundry_clarification_result(result)
         reply = result.get("reply", "")
         created_draft = None
-        for step in result.get("steps", []):
-            if step.get("type") == "tool_start" and step.get("name") == "propose_reusable_skill":
-                args = step.get("input", {})
-                task_text = args.get("task", text) if isinstance(args, dict) else text
-                draft = next((d for d in skills.DRAFTS.values() if d.get("request") == task_text), None)
-                if draft:
-                    created_draft = draft
+        draft_id = result.get("created_draft_id")
+        if draft_id:
+            created_draft = skills.DRAFTS.get(draft_id)
+            logger.info(
+                "chat_draft_lookup draft_id=%s status=%s draft_count=%s",
+                draft_id, "found" if created_draft else "missing", len(skills.DRAFTS),
+            )
+        elif any(step.get("name") == "propose_reusable_skill" for step in result.get("steps", [])):
+            logger.warning("chat_draft_lookup status=no_created_draft draft_count=%s", len(skills.DRAFTS))
         if created_draft:
+            if workspace == "foundry":
+                FOUNDRY_ACTIVE_DRAFT_ID = created_draft["id"]
+                FOUNDRY_SESSION_SKILL_NAME = created_draft.get("skill", {}).get("name")
+            logger.info("chat_draft_sse_delivery_started draft_id=%s skill_type=%s", draft_id, created_draft.get("skill", {}).get("skill_type", "unknown"))
+            logger.info("chat_draft_sse_payload draft_id=%s payload=%s", draft_id, json.dumps(created_draft, ensure_ascii=False, default=str))
             yield "data: " + json.dumps({"type": "draft", "draft": created_draft}, ensure_ascii=False, default=str) + "\n\n"
+            yield "data: " + json.dumps({"type": "critique_start", "draft_id": created_draft["id"]}, ensure_ascii=False) + "\n\n"
+            critique = await asyncio.to_thread(agent.critique_skill_draft_once, created_draft)
+            yield "data: " + json.dumps({"type": "critique", "draft_id": created_draft["id"], **critique}, ensure_ascii=False, default=str) + "\n\n"
+            logger.info("chat_draft_sse_delivery_finished draft_id=%s status=sent", draft_id)
         elif workspace == "foundry" and result.get("suggest_skill") and not _has_matching_approved_skill(" ".join(m.get("content", "") for m in messages[-6:])):
             yield "data: " + json.dumps({"type": "skill_offer", "request": text}, ensure_ascii=False) + "\n\n"
         messages.append({"role": "assistant", "content": reply})
@@ -530,9 +581,18 @@ def chat_stream(payload: ChatInput):
 
 
 def _clear_chat(workspace: str):
+    global FOUNDRY_ACTIVE_DRAFT_ID, FOUNDRY_SESSION_SKILL_NAME, FOUNDRY_PENDING_CLARIFICATION
     messages = FOUNDRY_MESSAGES if workspace == "foundry" else RUNNER_MESSAGES
     previous_messages = len(messages)
     messages.clear()
+    if workspace == "foundry":
+        draft_id = FOUNDRY_ACTIVE_DRAFT_ID
+        if draft_id:
+            skills.DRAFTS.pop(draft_id, None)
+        FOUNDRY_ACTIVE_DRAFT_ID = None
+        FOUNDRY_SESSION_SKILL_NAME = None
+        FOUNDRY_PENDING_CLARIFICATION = False
+        logger.info("foundry_skill_session_cleared unapproved_draft_removed=%s", bool(draft_id))
     logger.info("chat_history_cleared workspace=%s messages_removed=%s", workspace, previous_messages)
     return {"ok": True}
 
@@ -554,7 +614,13 @@ def clear_chat():
 
 @app.post("/api/skills/drafts")
 def create_draft(payload: ChatInput):
-    return agent._skill_proposal(payload.message)
+    global FOUNDRY_ACTIVE_DRAFT_ID, FOUNDRY_SESSION_SKILL_NAME
+    if FOUNDRY_ACTIVE_DRAFT_ID is not None:
+        raise HTTPException(409, "This conversation already has a skill. Clear conversation to start another skill.")
+    draft = agent._skill_proposal(payload.message)
+    FOUNDRY_ACTIVE_DRAFT_ID = draft["id"]
+    FOUNDRY_SESSION_SKILL_NAME = draft.get("skill", {}).get("name")
+    return draft
 
 
 @app.put("/api/skills/drafts/{draft_id}")
@@ -563,6 +629,7 @@ def edit_draft(draft_id: str, payload: DraftInput):
     if not draft:
         raise HTTPException(404, "Draft expired")
     draft["skill"].update(payload.skill)
+    draft.pop("automatic_critique", None)
     logger.info("skill_draft_edited draft_id=%s fields=%s", draft_id, len(payload.skill))
     return draft
 
@@ -573,6 +640,7 @@ def test_draft(draft_id: str, payload: DraftInput):
     if not draft:
         raise HTTPException(404, "Draft expired")
     draft["skill"].update(payload.skill)
+    draft.pop("automatic_critique", None)
     result = skills.test_code(draft["skill"].get("code", ""), payload.inputs, draft_id) if draft["skill"].get("skill_type") in {"python", "hybrid"} else {"success": True, "stdout": "Instructions reviewed; no Python was run.", "stderr": "", "error": None, "exit_code": 0, "duration_ms": 0, "source_hash": ""}
     draft["attempts"].append({"result": result, "skill": dict(draft["skill"])})
     logger.info(
@@ -580,6 +648,14 @@ def test_draft(draft_id: str, payload: DraftInput):
         draft_id, draft["skill"].get("skill_type"), result.get("success"), result.get("status", "reviewed"),
     )
     return result
+
+
+@app.post("/api/skills/drafts/{draft_id}/critique")
+async def critique_draft(draft_id: str):
+    draft = skills.DRAFTS.get(draft_id)
+    if not draft:
+        raise HTTPException(404, "Draft expired")
+    return await asyncio.to_thread(agent.critique_skill_draft_once, draft)
 
 
 @app.post("/api/skills/drafts/{draft_id}/review")
@@ -613,7 +689,7 @@ def review_draft(draft_id: str, payload: ReviewInput):
 
 @app.patch("/api/skills/{slug}")
 def patch_skill(slug: str, payload: EditInput):
-    result = skills.update_skill(slug, payload.content)
+    result = skills.update_skill(slug, payload.content, inputs=payload.inputs or None)
     if result is None:
         raise HTTPException(404, "Skill not found")
     return result
@@ -698,9 +774,41 @@ def revise_draft(draft_id: str, payload: ReviewInput):
                 raise ValueError(contract_error)
         before = draft["skill"]
         draft["skill"] = revised_dict
+        draft.pop("automatic_critique", None)
         draft["revision_diff"] = {key: {"before": before.get(key), "after": revised_dict.get(key)} for key in revised_dict if before.get(key) != revised_dict.get(key)}
         draft["attempts"].clear()
         return {"status": "revised", "draft": draft, "diff": draft["revision_diff"]}
     except Exception as exc:
         logger.error("skill_revision_failed error_type=%s", type(exc).__name__)
         raise HTTPException(502, f"The model could not produce a structured revision: {type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/skills/{slug}/agent-revision")
+def revise_approved_skill(slug: str, payload: AgentRevisionInput):
+    item = skills.get_skill(slug)
+    if not item:
+        raise HTTPException(404, "Skill not found")
+    if not payload.feedback.strip():
+        raise HTTPException(422, "Describe the change you want the agent to make")
+    current = payload.current_skill or item["content"]
+    draft_id = uuid.uuid4().hex
+    temporary = {
+        "id": draft_id,
+        "request": f"Revise the approved skill {item['name']} while preserving its identity",
+        "skill": current,
+        "attempts": [],
+    }
+    skills.DRAFTS[draft_id] = temporary
+    try:
+        response = revise_draft(draft_id, ReviewInput(action="revise", skill={}, feedback=payload.feedback))
+        revised = response["draft"]["skill"]
+        # Skill identity is the library slug; content edits must not silently
+        # create a second library entry under a changed name.
+        revised["name"] = item["name"]
+        before = current
+        diff = {key: {"before": before.get(key), "after": revised.get(key)}
+                for key in revised if before.get(key) != revised.get(key)}
+        logger.info("approved_skill_agent_revision_proposed slug=%s changed_fields=%s", slug, ",".join(diff))
+        return {"status": "revision_proposed", "skill": revised, "diff": diff}
+    finally:
+        skills.DRAFTS.pop(draft_id, None)

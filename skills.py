@@ -171,7 +171,10 @@ def propose_skill(task: str, candidate: dict | None = None) -> dict:
     skill.setdefault("inputs", {})
     draft_id = uuid.uuid4().hex
     DRAFTS[draft_id] = {"id": draft_id, "request": task, "skill": skill, "attempts": []}
-    logger.info("skill_draft_created draft_id=%s skill_type=%s request_chars=%s", draft_id, skill.get("skill_type"), len(task))
+    logger.info(
+        "skill_draft_created draft_id=%s stored=%s skill_type=%s skill_name=%s request_chars=%s field_count=%s",
+        draft_id, DRAFTS.get(draft_id) is not None, skill.get("skill_type"), skill.get("name"), len(task), len(skill),
+    )
     return DRAFTS[draft_id]
 
 
@@ -183,6 +186,8 @@ def python_entrypoint_error(code: str) -> str | None:
     entry = next((node for node in parsed.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"), None)
     if entry is None or isinstance(entry, ast.AsyncFunctionDef) or not entry.args.args:
         return "Python skills must define a synchronous run(inputs) function that returns the skill result; main() or print-only source is not a valid entry point."
+    if not any(isinstance(node, ast.Return) for node in ast.walk(entry)):
+        return "The run(inputs) function must return a result; print-only code is not a usable skill implementation."
     return None
 
 
@@ -225,7 +230,9 @@ try:
 except Exception as exc:
     envelope = {'result': None, 'user_stdout': captured_out.getvalue(), 'user_stderr': captured_err.getvalue(), 'exception': f'{type(exc).__name__}: {exc}'}
 print(json.dumps(envelope))"""
-        command = [docker, "run", "--rm", "--network", "none", "--read-only", "--user", "65534:65534",
+        # Omit --network so the container uses Docker's default network and
+        # Python skills can call external APIs when Docker permits outbound access.
+        command = [docker, "run", "--rm", "--read-only", "--user", "65534:65534",
                    "--memory", "128m", "--cpus", "0.5", "--pids-limit", "32", "--cap-drop", "ALL",
                    "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
                    "--mount", f"type=bind,src={work.resolve()},dst=/work,readonly", "python:3.12-alpine", "python", "-I", "-c", runner]
@@ -275,9 +282,9 @@ print(json.dumps(envelope))"""
     return result
 
 
-def promote(draft: dict, actor: str = "user") -> dict:
+def promote(draft: dict, actor: str = "user", prevalidated: bool = False) -> dict:
     skill = draft["skill"]
-    if skill.get("skill_type") in {"python", "hybrid"}:
+    if not prevalidated and skill.get("skill_type") in {"python", "hybrid"}:
         run = test_code(skill.get("code", ""), draft.get("accept_inputs", {"user_input": draft["request"]}))
         if not run["success"]:
             logger.warning("skill_promotion_blocked slug=%s reason=python_test_failed", slugify(skill.get("name", "skill")))
@@ -302,18 +309,22 @@ def promote(draft: dict, actor: str = "user") -> dict:
     return {"status": "approved", "skill": get_skill(slug)}
 
 
-def update_skill(slug: str, content: dict, actor: str = "user") -> dict:
+def update_skill(slug: str, content: dict, actor: str = "user", inputs: dict | None = None) -> dict:
     old = get_skill(slug)
     if not old:
         return None
     skill = {**old["content"], **content}
-    draft = {"skill": skill, "request": "revision", "accept_inputs": {"user_input": "revision regression"}}
+    test_inputs = inputs
+    if test_inputs is None:
+        tests = skill.get("tests", [])
+        test_inputs = tests[0].get("inputs", {}) if tests and isinstance(tests[0], dict) else {"user_input": "revision regression"}
+    draft = {"skill": skill, "request": "revision", "accept_inputs": test_inputs}
     if skill.get("skill_type") in {"python", "hybrid"}:
         run = test_code(skill.get("code", ""), draft["accept_inputs"])
         if not run["success"]:
             logger.warning("skill_update_blocked slug=%s reason=python_test_failed", slug)
             return {"status": "test_failed", "test": run}
-    return promote(draft, actor)
+    return promote(draft, actor, prevalidated=True)
 
 
 def deprecate(slug: str) -> dict | None:

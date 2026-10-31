@@ -1,16 +1,28 @@
 def add(a, b):
     return a + b
 
+
 def subtract(a, b):
     return a - b
+
 
 def multiply(a, b):
     return a * b
 
+
 def divide(a, b):
     if b == 0:
-        raise ValueError('Division by zero is not allowed')
-    return a / b
+        return {
+            'success': False,
+            'result': None,
+            'error': 'Division by zero is not allowed'
+        }
+    return {
+        'success': True,
+        'result': a / b,
+        'error': None
+    }
+
 
 def run(inputs):
     operation = inputs.get('operation')
@@ -37,28 +49,20 @@ def run(inputs):
             'error': 'Inputs a and b must be numeric'
         }
 
-    try:
-        operations = {
-            'add': add,
-            'subtract': subtract,
-            'multiply': multiply,
-            'divide': divide
-        }
-        result = operations[operation](a, b)
-        return {
-            'success': True,
-            'operation': operation,
-            'a': a,
-            'b': b,
-            'result': result,
-            'error': None
-        }
-    except Exception as e:
-        return {
-            'success': False,
-            'operation': operation,
-            'a': a,
-            'b': b,
-            'result': None,
-            'error': str(e)
-        }
+    operations = {
+        'add': lambda x, y: {'success': True, 'result': add(x, y), 'error': None},
+        'subtract': lambda x, y: {'success': True, 'result': subtract(x, y), 'error': None},
+        'multiply': lambda x, y: {'success': True, 'result': multiply(x, y), 'error': None},
+        'divide': divide
+    }
+
+    outcome = operations[operation](a, b)
+
+    return {
+        'success': outcome['success'],
+        'operation': operation,
+        'a': a,
+        'b': b,
+        'result': outcome['result'],
+        'error': outcome['error']
+    }

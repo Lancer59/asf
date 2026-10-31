@@ -19,10 +19,22 @@ function addMessage(role,text=''){
   node.innerHTML=`<div class="avatar">${role==='user'?'U':'✳'}</div><div class="bubble">${role==='assistant'?`<div class="response-content markdown-body runner-content">${format(text)}</div>`:`<div class="response-content">${esc(text)}</div>`}</div>`;
   box.append(node);box.scrollTop=box.scrollHeight;return node;
 }
+function addWorkStatus(node){
+  const status=document.createElement('div');status.className='work-status';status.setAttribute('role','status');status.setAttribute('aria-live','polite');
+  status.innerHTML='<div class="work-bot" aria-hidden="true"><span class="bot-antenna"></span><div class="bot-head"><i></i><i></i><b></b></div><div class="bot-body"><span class="bot-arm bot-arm-left"></span><span class="bot-core">✳</span><span class="bot-arm bot-arm-right"></span></div><span class="bot-spark">✦</span></div><div class="work-copy"><strong>Getting started</strong><span>Finding the right way to help…</span><div class="work-track"><i></i></div></div>';
+  node.querySelector('.bubble').append(status);return status;
+}
+function updateWorkStatus(status,event){
+  if(!status)return;
+  const title=$('strong',status),detail=$('.work-copy span',status);
+  const labels={progress:event.message||'Working through your request',tool_start:event.label||'Running a step',tool_end:event.label||'Step complete'};
+  title.textContent=labels[event.type]||'Working through your request';
+  detail.textContent=event.type==='progress'?'Choosing the useful steps for this task.':event.type==='tool_start'?'Running the tool and collecting its result.':'Adding the result to your answer.';
+  if(event.type==='error'){title.textContent='This needs another look';detail.textContent=event.message||'The request could not be completed.';status.classList.add('work-failed')}
+}
 function addStep(node,event){
   let panel=$('.runner-steps',node);
   if(!panel){panel=document.createElement('details');panel.className='runner-steps';panel.innerHTML='<summary>Steps</summary><ol></ol>';node.querySelector('.bubble').append(panel)}
-  panel.open=true;
   const list=$('ol',panel),item=document.createElement('li');
   const label=event.label||event.message||'Working on your request';
   item.innerHTML=`<strong>${esc(label)}</strong>${event.input?`<pre>${esc(JSON.stringify(event.input,null,2))}</pre>`:''}${event.output?`<pre>${esc(event.output)}</pre>`:''}`;
@@ -33,16 +45,16 @@ async function loadConfig(){const config=await api('/api/config');state.models=c
 $('#chat-model-picker').addEventListener('change',async event=>{const old=state.activeModelId;event.target.disabled=true;$('#model-switch-status').textContent='Switching model…';try{const result=await api('/api/config/model',{method:'PUT',body:JSON.stringify({model_id:event.target.value})});await loadConfig();$('#model-switch-status').textContent=`Using ${result.label}`}catch(error){event.target.value=old||'';$('#model-switch-status').textContent=error.message;updatePicker()}});
 async function sendMessage(text){
   text=text.trim();if(!text||state.busy)return;state.busy=true;updatePicker();
-  addMessage('user',text);const assistant=addMessage('assistant');const bubble=$('.response-content',assistant);bubble.innerHTML='<span class="stream-placeholder">✳ Working…</span>';
+  addMessage('user',text);const assistant=addMessage('assistant');const workStatus=addWorkStatus(assistant);const bubble=$('.response-content',assistant);bubble.innerHTML='';
   $('#chat-input').value='';state.reply='';let pending='';
   try{
     const response=await fetch('/api/runner/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
     if(!response.ok)throw new Error((await response.json()).detail||`Request failed (${response.status})`);
     const reader=response.body.getReader(),decoder=new TextDecoder();
-    const handle=event=>{if(event.type==='token'){if($('.stream-placeholder',bubble))bubble.innerHTML='';state.reply+=event.text;bubble.innerHTML=format(state.reply)}else if(event.type==='done'){if(event.error)bubble.innerHTML=format(event.error);else if(!state.reply)bubble.innerHTML=format(event.reply||'No response.')}else if(event.type==='error'){bubble.innerHTML=format(event.message||'Request failed')}else addStep(assistant,event)};
+    const handle=event=>{if(event.type==='token'){state.reply+=event.text;bubble.innerHTML=format(state.reply)}else if(event.type==='done'){if(event.error)bubble.innerHTML=format(event.error);else if(!state.reply)bubble.innerHTML=format(event.reply||'No response.');workStatus.remove()}else if(event.type==='error'){bubble.innerHTML=format(event.message||'Request failed');updateWorkStatus(workStatus,event)}else{updateWorkStatus(workStatus,event);addStep(assistant,event)}};
     while(true){const {value,done}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const frames=pending.split('\n\n');pending=frames.pop();for(const frame of frames){const line=frame.split('\n').find(item=>item.startsWith('data: '));if(line)handle(JSON.parse(line.slice(6)))}}
     pending+=decoder.decode();if(pending.trim()){const line=pending.split('\n').find(item=>item.startsWith('data: '));if(line)handle(JSON.parse(line.slice(6)))}
-  }catch(error){bubble.innerHTML=format(`Request failed: ${error.message}`);addStep(assistant,{label:'Request failed',output:error.message})}
+  }catch(error){bubble.innerHTML=format(`Request failed: ${error.message}`);updateWorkStatus(workStatus,{type:'error',message:error.message});addStep(assistant,{label:'Request failed',output:error.message})}
   finally{state.busy=false;updatePicker();$('#chat-input').focus()}
 }
 $('#chat-form').addEventListener('submit',event=>{event.preventDefault();sendMessage($('#chat-input').value)});

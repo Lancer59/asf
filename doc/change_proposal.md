@@ -2,6 +2,8 @@
 
 **Status:** Approved and implemented in the current application.
 
+**Implementation note:** This document records the approved workspace split. The implemented Foundry experience has since added a focused agent-assisted edit flow for approved skills; the extension is described below and in `technical_readme.md`.
+
 ## Summary
 
 Split ASF’s current mixed chat into two distinct workspaces in the same project:
@@ -36,6 +38,8 @@ The change refines the brief’s single conversational agent into two role-speci
 - Entry page: `/foundry`.
 - Chat endpoint: `POST /api/foundry/chat/stream`.
 - Primary actions: create a reusable skill, inspect the library, test and revise a draft, approve a passing skill, edit a version, or deprecate a skill.
+- From an approved skill's detail view, **Edit with agent** opens a focused revision chat. The agent proposes changes and displays a field diff; the saved version remains untouched until the user applies the proposal.
+- Follow-up messages revise the pending proposal. Applying a Python/hybrid proposal validates it with the visible JSON test inputs; a failed or unavailable run leaves the current version unchanged. The existing skill name and slug remain stable.
 - A greeting or general question receives a brief response without searching the skill library.
 - Ordinary task execution is outside this workspace. If the user asks for a one-off calculation or research task, the UI can direct them to Skill Runner.
 - The Foundry agent may read approved-skill metadata when the user is managing skills or when it needs to avoid proposing a duplicate. It does not execute approved skills to fulfill ordinary user tasks.
@@ -86,6 +90,7 @@ Keep application code function-based, consistent with the submitted brief. Provi
 | `POST /api/runner/chat/stream` | Stream Runner task/tool/skill activity and response text. |
 | `POST /api/foundry/chat/clear` | Clear Foundry’s volatile transcript. |
 | `POST /api/runner/chat/clear` | Clear Runner’s volatile transcript. |
+| `POST /api/skills/{slug}/agent-revision` | Return an unsaved, structured revision proposal for an approved skill and feedback. |
 | Existing `/api/skills/...` routes | Shared library, draft review, test, approval, version, and deprecation operations. |
 
 ## Agent boundaries
@@ -96,6 +101,7 @@ Keep application code function-based, consistent with the submitted brief. Provi
 | Search approved skills for task execution | No | Yes, only for a plausible match |
 | Execute an approved skill for a user task | No | Yes |
 | Propose or revise a skill draft | Yes | No |
+| Propose a revision to approved skill content | Yes; user applies explicitly | No |
 | Run sandbox tests for a draft | Yes, by explicit user action | No |
 | Approve, version, or deprecate skills | Yes, under existing review rules | No |
 | Use task tools such as web search | Only when needed for skill authoring/evaluation | Yes, subject to availability and truthful tool-result reporting |
@@ -115,6 +121,7 @@ The change should add or revise tests before considering the implementation comp
 7. **Foundry lifecycle:** an explicit reusable-skill request can produce a draft, run tests, revise, and require explicit approval; one-off tasks do not silently create drafts.
 8. **SSE and errors:** each stream emits role-appropriate progress and final events; provider/tool failures are visible and not replaced with fabricated success.
 9. **Live agent checks:** opt-in tests send bounded real requests to each configured role and assert expected tool calls and returned tool results. Keep these separate from deterministic offline tests and document possible provider charges.
+10. **Approved-skill agent edit:** confirm the model returns a structured proposal and field diff without mutating the approved record; applying a Python/hybrid proposal validates with submitted test inputs and creates a new version only on success.
 
 Example behavior checks:
 
@@ -132,10 +139,10 @@ Keep project documentation under `doc/`. `doc/technical_readme.md` is the canoni
 
 ## Scope and non-goals
 
-Included: two user-facing workspaces, role-specific agent setup and prompts, separate route-level conversations and clear actions, shared approved skill store and lifecycle, shared model configuration, role-specific tools, UI navigation, and tests for routing, agent behavior, isolation, and tool use.
+Included: two user-facing workspaces, role-specific agent setup and prompts, separate route-level conversations and clear actions, shared approved skill store and lifecycle, shared model configuration, role-specific tools, UI navigation, agent-proposed revisions of approved skills with explicit user application, and tests for routing, agent behavior, isolation, and tool use.
 
 Not included: separate projects, separate skill directories or databases, persistent chat history, automatic skill approval, unrestricted autonomous skill creation by Runner, a new vector database, a new frontend framework, multiple server processes by default, or claiming that an agent is correct based only on natural-language output.
 
-## Decision requested
+## Decision record
 
-Approve or revise this separation before implementation. In particular, confirm that `/foundry` and `/runner` are suitable workspace entry URLs and that one server process with separate page/API routes meets the intended meaning of separate startup endpoints.
+The workspace split was approved and implemented. `/foundry` and `/runner` are separate pages and API flows in one local project/server process, sharing the approved skill library and lifecycle data. The agent-assisted approved-skill edit is a follow-on capability within Foundry; it does not change the separation or allow Runner to mutate skills.

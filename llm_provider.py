@@ -171,8 +171,9 @@ def _completion_limit() -> int:
         return 1200
 
 
-def create_chat_model(*, stream_usage: bool = True):
+def create_chat_model(*, stream_usage: bool = True, max_tokens: int | None = None):
     """Build a LangChain model client for the selected profile."""
+    completion_limit = max(1, int(max_tokens)) if max_tokens is not None else _completion_limit()
     profile = active_profile()
     api_key = _profile_key(profile)
     provider = profile["provider_type"]
@@ -186,7 +187,7 @@ def create_chat_model(*, stream_usage: bool = True):
 
             base_url = endpoint if endpoint.endswith("/openai/v1") else endpoint + "/openai/v1"
             options = {"model": deployment, "base_url": base_url, "api_key": api_key,
-                      "max_completion_tokens": _completion_limit(), "stream_usage": stream_usage}
+                      "max_completion_tokens": completion_limit, "stream_usage": stream_usage}
             if reasoning_effort:
                 options["reasoning_effort"] = reasoning_effort
             return ChatOpenAI(**options)
@@ -194,7 +195,7 @@ def create_chat_model(*, stream_usage: bool = True):
         from langchain_openai import AzureChatOpenAI
 
         options = {"azure_endpoint": endpoint, "azure_deployment": deployment, "api_version": api_version,
-                   "api_key": api_key, "max_completion_tokens": _completion_limit(), "stream_usage": stream_usage}
+                   "api_key": api_key, "max_completion_tokens": completion_limit, "stream_usage": stream_usage}
         if reasoning_effort:
             options["reasoning_effort"] = reasoning_effort
         return AzureChatOpenAI(**options)
@@ -204,10 +205,10 @@ def create_chat_model(*, stream_usage: bool = True):
     model_name = profile["model"]
     options = {"model": model_name, "api_key": api_key, "base_url": profile["base_url"], "stream_usage": stream_usage}
     if model_name.lower().startswith(("gpt-5", "o1", "o3", "o4")):
-        options["max_completion_tokens"] = _completion_limit()
+        options["max_completion_tokens"] = completion_limit
         if profile.get("reasoning_effort"):
             options["reasoning_effort"] = profile["reasoning_effort"]
     else:
         options["temperature"] = 0
-        options["max_tokens"] = _completion_limit()
+        options["max_tokens"] = completion_limit
     return ChatOpenAI(**options)
