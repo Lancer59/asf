@@ -82,6 +82,22 @@ class ProviderConfig(BaseModel):
     api_version: str = ""
 
 
+class ModelSelection(BaseModel):
+    model_id: str
+
+
+class ModelProfileConfig(BaseModel):
+    model_id: str
+    create: bool = False
+    label: str
+    provider_type: str
+    base_url: str
+    model: str
+    api_key_env: str
+    api_key: str = ""
+    api_version: str = ""
+
+
 @app.get("/")
 def home(request: Request):
     return templates.TemplateResponse(request, "index.html", {"configured": llm_provider.provider_configured()})
@@ -239,11 +255,13 @@ def configuration():
     return {
         "llm_configured": llm_provider.provider_configured(),
         "provider_type": selected["provider_type"],
+        "active_model_id": selected["model_id"],
         "base_url": selected["base_url"],
         "model": selected["model"],
         "api_version": selected["api_version"],
         "azure_openai": azure,
         "openai_compatible": compatible,
+        "models": llm_provider.model_catalog(),
         "search_configured": bool(os.getenv("TAVILY_API_KEY")),
         "docker_available": bool(__import__("shutil").which("docker")),
     }
@@ -293,10 +311,138 @@ def save_provider_config(payload: ProviderConfig):
     else:
         values.update({"ASF_LLM_PROVIDER": provider_type, "OPENAI_BASE_URL": base_url, "OPENAI_API_KEY": api_key, "LLM_MODEL": model_name})
         os.environ.update({"ASF_LLM_PROVIDER": provider_type, "OPENAI_BASE_URL": base_url, "OPENAI_API_KEY": api_key, "LLM_MODEL": model_name})
+        active_id = llm_provider.DEFAULT_MODEL_ID
+    if provider_type == llm_provider.AZURE_OPENAI:
+        active_id = llm_provider.AZURE_MODEL_ID
+    values["ASF_ACTIVE_MODEL"] = active_id
+    os.environ["ASF_ACTIVE_MODEL"] = active_id
     env_path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
     endpoint_host = urlsplit(base_url).hostname or "configured"
     logger.info("provider_configuration_saved provider=%s model=%s endpoint_host=%s", provider_type, model_name, endpoint_host)
     return {"ok": True, "llm_configured": True, "provider_type": provider_type, "base_url": base_url, "model": model_name, "api_version": api_version}
+
+
+@app.put("/api/config/model")
+def select_model(payload: ModelSelection):
+    profile = next((item for item in llm_provider.model_profiles() if item["id"] == payload.model_id), None)
+    if profile is None:
+        raise HTTPException(404, "Model option not found")
+    if not llm_provider.profile_configured(profile):
+        raise HTTPException(422, "Configure this model's API key and endpoint before selecting it")
+    env_path = ROOT / ".env"
+    values = {}
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.split("=", 1)
+                values[key.strip()] = value
+    values["ASF_ACTIVE_MODEL"] = profile["id"]
+    values["ASF_LLM_PROVIDER"] = profile["provider_type"]
+    env_path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
+    os.environ["ASF_ACTIVE_MODEL"] = profile["id"]
+    os.environ["ASF_LLM_PROVIDER"] = profile["provider_type"]
+    logger.info("model_selected model_id=%s provider=%s model=%s", profile["id"], profile["provider_type"], profile["model"])
+    return {
+        "ok": True,
+        "model_id": profile["id"],
+        "label": profile["label"],
+        "provider_type": profile["provider_type"],
+        "model": profile["model"],
+    }
+
+
+@app.put("/api/config/model-profile")
+def save_model_profile(payload: ModelProfileConfig):
+    """Create or edit an ASF_MODELS profile without exposing its secret."""
+    profile = next((item for item in llm_provider.model_profiles() if item["id"] == payload.model_id), None)
+    creating = payload.create
+    if not creating and (profile is None or profile.get("legacy")):
+        raise HTTPException(404, "Custom model profile not found")
+    provider_type = payload.provider_type.strip().lower()
+    if provider_type not in {llm_provider.OPENAI_COMPATIBLE, llm_provider.AZURE_OPENAI}:
+        raise HTTPException(422, "Choose OpenAI-compatible or Azure OpenAI")
+    base_url = payload.base_url.strip().rstrip("/")
+    model_name = payload.model.strip()
+    key_env = payload.api_key_env.strip()
+    if not base_url.startswith(("https://", "http://")) or not model_name:
+        raise HTTPException(422, "Enter a valid http(s) endpoint and model name")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key_env):
+        raise HTTPException(422, "API key environment variable must be a valid variable name")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", payload.model_id):
+        raise HTTPException(422, "Profile ID must start with a letter or number and use only letters, numbers, dots, underscores, or hyphens")
+    label = payload.label.strip() or model_name
+
+    env_path = ROOT / ".env"
+    raw_catalog = os.getenv("ASF_MODELS", "").strip()
+    try:
+        catalog = json.loads(raw_catalog) if raw_catalog else []
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, "ASF_MODELS is not valid JSON") from exc
+    if not isinstance(catalog, list):
+        raise HTTPException(422, "ASF_MODELS must be a JSON array")
+    raw_profile = next((item for item in catalog if isinstance(item, dict) and item.get("id") == payload.model_id), None)
+    if profile and raw_profile is None:
+        raise HTTPException(409, "Restart ASF to load the latest ASF_MODELS catalog before editing it")
+    if creating and any(item["id"] == payload.model_id for item in llm_provider.model_profiles()):
+        raise HTTPException(409, "That profile ID is already in use")
+    if not creating and not profile:
+        raise HTTPException(404, "Custom model profile not found")
+    if not profile and raw_profile:
+        raise HTTPException(409, "That profile ID is already in use")
+    updated = dict(raw_profile or {})
+    updated.update({"id": payload.model_id, "label": label, "provider_type": provider_type,
+                    "model": model_name, "api_key_env": key_env})
+    if provider_type == llm_provider.AZURE_OPENAI:
+        updated.pop("base_url", None)
+        updated["endpoint"] = base_url + "/"
+        updated["api_version"] = payload.api_version.strip() or "2024-08-01-preview"
+    else:
+        updated.pop("endpoint", None)
+        updated["base_url"] = base_url
+        updated.pop("api_version", None)
+    if raw_profile:
+        catalog = [updated if isinstance(item, dict) and item.get("id") == payload.model_id else item for item in catalog]
+    else:
+        catalog.append(updated)
+    if len(catalog) > 100:
+        raise HTTPException(422, "ASF_MODELS supports at most 100 custom profiles")
+    catalog_json = json.dumps(catalog, ensure_ascii=False, separators=(",", ":"))
+    if len(catalog_json) > 32768:
+        raise HTTPException(422, "ASF_MODELS must be 32 KiB or smaller")
+    raw_env_lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.exists() else []
+    writes = {"ASF_MODELS": json.dumps(catalog_json), "ASF_ACTIVE_MODEL": payload.model_id,
+              "ASF_LLM_PROVIDER": provider_type}
+    if payload.api_key.strip():
+        writes[key_env] = payload.api_key.strip()
+    for key, value in writes.items():
+        os.environ[key] = catalog_json if key == "ASF_MODELS" else value
+    seen = set()
+    output_lines = []
+    for line in raw_env_lines:
+        if "=" in line and not line.lstrip().startswith("#"):
+            key = line.split("=", 1)[0].strip()
+            if key in writes:
+                if key not in seen:
+                    output_lines.append(f"{key}={writes[key]}")
+                    seen.add(key)
+                continue
+        output_lines.append(line)
+    for key, value in writes.items():
+        if key not in seen:
+            output_lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+    logger.info("model_profile_saved model_id=%s provider=%s model=%s", payload.model_id, provider_type, model_name)
+    return {"ok": True, "model_id": payload.model_id, "label": label, "provider_type": provider_type,
+            "model": model_name, "configured": llm_provider.profile_configured(next(
+                item for item in llm_provider.model_profiles() if item["id"] == payload.model_id))}
+
+
+@app.post("/api/config/model-profile")
+def create_model_profile(payload: ModelProfileConfig):
+    if any(item["id"] == payload.model_id for item in llm_provider.model_profiles()):
+        raise HTTPException(409, "That profile ID is already in use")
+    payload.create = True
+    return save_model_profile(payload)
 
 
 @app.get("/api/skills")

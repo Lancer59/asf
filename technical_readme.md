@@ -106,6 +106,8 @@ This topology is designed for a single local user. It currently has no authentic
 | `AZURE_OPENAI_API_VERSION` | Azure data-plane API version. | Defaults to `2024-08-01-preview`; `v1` uses the Azure OpenAI v1 route. |
 | `AZURE_OPENAI_DEPLOYMENT_NAME` | Azure model deployment name. | Defaults to `gpt-5.3-chat`; set this to the deployment name in the Azure resource. |
 | `AZURE_OPENAI_REASONING_EFFORT` | Optional GPT reasoning effort. | Empty leaves the model default; provider/model support varies. |
+| `ASF_MODELS` | Optional JSON array defining the complete model picker list. | Each entry has a unique `id`, `provider_type`, `model`, `base_url` (or Azure `endpoint`), and `api_key_env`; optional `label`, Azure `api_version`, and `reasoning_effort`. If set, legacy profiles are not appended. |
+| `ASF_ACTIVE_MODEL` | Selected profile ID. | Updated by the chat model picker; defaults to the legacy provider choice when unset or unknown. |
 | `TAVILY_API_KEY` | Enables the web search tool. | Optional; without it, chat can still run. |
 | `PORT` | Local HTTP port. | `8000`. |
 | `LOG_LEVEL` | Minimum ASF log level. | `INFO`; use `DEBUG` for more event metadata. |
@@ -114,6 +116,10 @@ This topology is designed for a single local user. It currently has no authentic
 The Settings endpoint accepts a provider type, endpoint, API key, and model/deployment name. It requires an `http://` or `https://` URL, non-empty model, and key (the active provider's existing key may be reused if the submitted key is blank). OpenAI-compatible settings write `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `LLM_MODEL`; Azure settings write the separate `AZURE_OPENAI_*` variables. Selecting one profile does not overwrite the other profile's credentials. Both are saved in the project `.env` and take effect in the running process immediately. The endpoint does not make a test request to verify that credentials, endpoint, API version, and deployment work together.
 
 OpenAI-compatible providers use `ChatOpenAI`; Azure dated API versions use `AzureChatOpenAI`. Setting Azure API version to `v1` uses `ChatOpenAI` with `{AZURE_OPENAI_ENDPOINT}/openai/v1` and the deployment name as its model identifier. GPT-5 Azure requests use `max_completion_tokens` and omit `temperature`; the token ceiling uses `LLM_MAX_TOKENS`. A dated API version that predates this parameter may be rejected by the endpoint, so select an API version supported by the deployment or `v1`. Model/API compatibility, tool calling, context size, and structured output behavior are provider-dependent.
+
+`llm_provider.model_profiles()` uses validated entries from `ASF_MODELS` as the complete picker list (JSON, up to 100 profiles and 32 KiB). If it is unset or invalid, the two legacy environment profiles are used. IDs are unique and limited to alphanumeric characters plus `.`, `_`, and `-`; provider types are `openai_compatible` and `azure_openai`; endpoints must use HTTP or HTTPS. `api_key_env` names the environment variable containing the key. The config endpoint exposes IDs, labels, provider types, endpoint/model metadata, the key-variable name, and configured status, never key values. `PUT /api/config/model` rejects unknown or unconfigured profiles, then saves the selected ID to `.env` and process environment. The browser picker is disabled during a chat request and selects the profile used by the next chat and skill revision call. Updating catalog JSON requires an app restart; changing the active profile does not.
+
+The connection-settings dialog lists all profiles and adds or edits custom catalog entries through `POST` or `PUT /api/config/model-profile`. New profiles of either provider type append to `ASF_MODELS` and become available immediately. Each entry requires a unique ID; catalogs are limited to 100 entries and 32 KiB. The editor selects the saved profile and stores a newly entered key only in the environment variable named by `api_key_env`. Leaving the key field blank preserves the existing key. The dialog exposes the API key variable name for clarity, never its value. Built-in profiles continue to use `PUT /api/config/provider` and the established OpenAI/Azure variables.
 
 ### Logging and request correlation
 
@@ -244,6 +250,8 @@ Payload models are declared in `app.py`. FastAPI/Pydantic performs JSON parsing 
 | `GET /` | Render the single-page app shell. |
 | `GET /api/config` | Return provider/search configured flags, endpoint/model display values, and Docker availability. Does not reveal keys. |
 | `PUT /api/config/provider` | Validate and persist endpoint URL, API key, and model. |
+| `PUT /api/config/model-profile` | Update an existing custom `ASF_MODELS` entry and optionally its separately stored API key. |
+| `POST /api/config/model-profile` | Add a custom OpenAI-compatible or Azure profile to `ASF_MODELS`. |
 | `POST /api/chat/stream` | Accept `{message}` and return SSE. Empty trimmed messages return 422. |
 | `POST /api/chat/clear` | Clear process-local conversation messages. |
 | `GET /api/skills?q=&status=` | List/filter skill records. |

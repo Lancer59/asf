@@ -16,7 +16,7 @@ import skills
 @pytest.fixture(autouse=True)
 def default_model_provider(monkeypatch):
     monkeypatch.setenv("ASF_LLM_PROVIDER", "openai_compatible")
-    for key in ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME"):
+    for key in ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME", "ASF_MODELS", "ASF_ACTIVE_MODEL"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -77,6 +77,12 @@ def client(isolated_project):
                     result = app.get_skill(path.rsplit("/", 1)[1])
                 elif method == "PUT" and path == "/api/config/provider":
                     result = app.save_provider_config(app.ProviderConfig.model_validate(body))
+                elif method == "PUT" and path == "/api/config/model":
+                    result = app.select_model(app.ModelSelection.model_validate(body))
+                elif method == "PUT" and path == "/api/config/model-profile":
+                    result = app.save_model_profile(app.ModelProfileConfig.model_validate(body))
+                elif method == "POST" and path == "/api/config/model-profile":
+                    result = app.create_model_profile(app.ModelProfileConfig.model_validate(body))
                 elif method == "POST" and path == "/api/chat/stream":
                     result = app.chat_stream(app.ChatInput.model_validate(body))
                 elif method == "POST" and path == "/api/chat/clear":

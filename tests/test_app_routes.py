@@ -33,7 +33,7 @@ def test_provider_config_validation_and_save(client, monkeypatch, isolated_proje
     assert response.status_code == 200
     assert response.json() == {"ok": True, "llm_configured": True, "provider_type": "openai_compatible", "base_url": "https://llm.example/v1", "model": "test-model", "api_version": ""}
     assert (isolated_project / ".env").read_text(encoding="utf-8") == (
-        "ASF_LLM_PROVIDER=openai_compatible\nOPENAI_BASE_URL=https://llm.example/v1\nOPENAI_API_KEY=secret\nLLM_MODEL=test-model\n"
+        "ASF_LLM_PROVIDER=openai_compatible\nOPENAI_BASE_URL=https://llm.example/v1\nOPENAI_API_KEY=secret\nLLM_MODEL=test-model\nASF_ACTIVE_MODEL=openai-compatible\n"
     )
     assert app.configuration()["llm_configured"] is True
 
@@ -78,8 +78,119 @@ def test_azure_provider_saves_separate_profile_and_does_not_replace_openai_key(c
     assert "AZURE_OPENAI_API_VERSION=2024-08-01-preview" in saved
     assert "AZURE_OPENAI_DEPLOYMENT_NAME=gpt-5.3-chat" in saved
     assert "OPENAI_API_KEY=openai-profile-secret" in saved
+    assert "ASF_ACTIVE_MODEL=azure-openai" in saved
     assert app.configuration()["provider_type"] == "azure_openai"
     assert "AZURE_OPENAI_API_KEY" not in app.configuration()
+
+
+def test_custom_model_catalog_can_be_selected_and_persists_without_exposing_key(client, isolated_project, monkeypatch):
+    import json
+
+    profiles = [{
+        "id": "fast-local",
+        "label": "Fast local model",
+        "provider_type": "openai_compatible",
+        "base_url": "http://localhost:11434/v1",
+        "model": "qwen3:8b",
+        "api_key_env": "LOCAL_LLM_KEY",
+    }]
+    monkeypatch.setenv("ASF_MODELS", json.dumps(profiles))
+    monkeypatch.setenv("LOCAL_LLM_KEY", "local-secret")
+    (isolated_project / ".env").write_text("ASF_MODELS=" + json.dumps(profiles) + "\n", encoding="utf-8")
+
+    catalog = client.get("/api/config").json()
+    assert any(option["id"] == "fast-local" and option["configured"] for option in catalog["models"])
+    assert any(option.get("api_key_env") == "LOCAL_LLM_KEY" for option in catalog["models"] if option["id"] == "fast-local")
+    assert "local-secret" not in json.dumps(catalog)
+    response = client.put("/api/config/model", json={"model_id": "fast-local"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True, "model_id": "fast-local", "label": "Fast local model",
+        "provider_type": "openai_compatible", "model": "qwen3:8b",
+    }
+    assert app.configuration()["active_model_id"] == "fast-local"
+    assert "ASF_ACTIVE_MODEL=fast-local" in (isolated_project / ".env").read_text(encoding="utf-8")
+    assert "local-secret" not in json.dumps(response.json())
+
+
+def test_custom_model_profile_can_be_corrected_to_azure_and_saved(client, isolated_project, monkeypatch):
+    import json
+
+    profiles = [{
+        "id": "mid-level", "label": "GPT-5.3", "provider_type": "openai_compatible",
+        "base_url": "https://servicedeskgpt.openai.azure.com/", "model": "gpt-5.3-chat",
+        "api_key_env": "AZURE_OPENAI_API_KEY",
+    }]
+    monkeypatch.setenv("ASF_MODELS", json.dumps(profiles))
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-secret")
+    (isolated_project / ".env").write_text("ASF_MODELS=" + json.dumps(profiles) + "\nAZURE_OPENAI_API_KEY=azure-secret\n", encoding="utf-8")
+
+    response = client.put("/api/config/model-profile", json={
+        "model_id": "mid-level", "label": "GPT-5.3", "provider_type": "azure_openai",
+        "base_url": "https://servicedeskgpt.openai.azure.com/", "model": "gpt-5.3-chat",
+        "api_key_env": "AZURE_OPENAI_API_KEY", "api_version": "v1",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["provider_type"] == "azure_openai"
+    assert response.json()["configured"] is True
+    from dotenv import dotenv_values
+    saved = dotenv_values(isolated_project / ".env")
+    saved_profile = json.loads(saved["ASF_MODELS"])[0]
+    assert saved_profile["provider_type"] == "azure_openai"
+    assert saved_profile["endpoint"] == "https://servicedeskgpt.openai.azure.com/"
+    assert saved_profile["api_version"] == "v1"
+    assert saved["ASF_ACTIVE_MODEL"] == "mid-level"
+    assert "azure-secret" not in json.dumps(response.json())
+
+
+def test_can_add_multiple_openai_compatible_and_azure_profiles(client, isolated_project, monkeypatch):
+    import json
+    from dotenv import dotenv_values
+
+    monkeypatch.setenv("ASF_MODELS", "[]")
+    monkeypatch.setenv("LOCAL_MODEL_KEY", "local-secret")
+    monkeypatch.setenv("AZURE_DEMO_KEY", "azure-secret")
+    (isolated_project / ".env").write_text("ASF_MODELS=[]\n", encoding="utf-8")
+    profiles = [
+        {
+            "model_id": "local-chat", "create": True, "label": "Local chat",
+            "provider_type": "openai_compatible", "base_url": "http://localhost:11434/v1",
+            "model": "qwen3:8b", "api_key_env": "LOCAL_MODEL_KEY", "api_key": "local-secret",
+        },
+        {
+            "model_id": "azure-demo-2", "create": True, "label": "Azure demo 2",
+            "provider_type": "azure_openai", "base_url": "https://another.openai.azure.com/",
+            "model": "gpt-demo", "api_key_env": "AZURE_DEMO_KEY", "api_key": "azure-secret", "api_version": "v1",
+        },
+    ]
+
+    responses = [client.post("/api/config/model-profile", json=profile) for profile in profiles]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    saved = dotenv_values(isolated_project / ".env")
+    persisted = json.loads(saved["ASF_MODELS"])
+    assert [(profile["id"], profile["provider_type"]) for profile in persisted] == [
+        ("local-chat", "openai_compatible"), ("azure-demo-2", "azure_openai")
+    ]
+    assert persisted[1]["endpoint"] == "https://another.openai.azure.com/"
+    assert persisted[1]["api_version"] == "v1"
+    assert saved["ASF_ACTIVE_MODEL"] == "azure-demo-2"
+    assert "local-secret" not in json.dumps([response.json() for response in responses])
+    assert "azure-secret" not in json.dumps([response.json() for response in responses])
+
+
+def test_custom_model_without_its_key_cannot_be_selected(client, monkeypatch):
+    import json
+
+    monkeypatch.setenv("ASF_MODELS", json.dumps([{
+        "id": "missing-key", "provider_type": "openai_compatible", "base_url": "https://model.example/v1",
+        "model": "private-model", "api_key_env": "MISSING_MODEL_KEY",
+    }]))
+    response = client.put("/api/config/model", json={"model_id": "missing-key"})
+
+    assert response.status_code == 422
 
 
 def test_chat_rejects_blank_message(client):

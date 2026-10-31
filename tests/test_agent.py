@@ -214,6 +214,55 @@ def test_azure_v1_profile_uses_openai_v1_endpoint(monkeypatch):
     assert "temperature" not in captured
 
 
+def test_custom_compatible_profile_builds_client_using_its_key_env(monkeypatch):
+    profile = [{
+        "id": "fast-local", "label": "Fast local", "provider_type": "openai_compatible",
+        "base_url": "http://localhost:11434/v1", "model": "qwen3:8b", "api_key_env": "LOCAL_LLM_KEY",
+    }]
+    monkeypatch.setenv("ASF_MODELS", json.dumps(profile))
+    monkeypatch.setenv("ASF_ACTIVE_MODEL", "fast-local")
+    monkeypatch.setenv("LOCAL_LLM_KEY", "local-secret")
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options): captured.update(options)
+
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+
+    llm_provider.create_chat_model()
+
+    assert captured == {
+        "model": "qwen3:8b", "api_key": "local-secret", "base_url": "http://localhost:11434/v1",
+        "stream_usage": True, "temperature": 0, "max_tokens": 1200,
+    }
+
+
+def test_model_catalog_ignores_invalid_and_duplicate_profiles(monkeypatch):
+    monkeypatch.setenv("ASF_MODELS", json.dumps([
+        {"id": "bad id", "provider_type": "openai_compatible", "base_url": "https://other.example/v1", "model": "other"},
+        {"id": "valid-profile", "provider_type": "openai_compatible", "base_url": "https://other.example/v1", "model": "other"},
+        {"id": "valid-profile", "provider_type": "openai_compatible", "base_url": "https://other.example/v1", "model": "other", "api_key_env": "OTHER_KEY"},
+    ]))
+
+    ids = [profile["id"] for profile in llm_provider.model_profiles()]
+
+    assert "bad id" not in ids
+    assert ids == ["valid-profile"]
+
+
+def test_explicit_model_catalog_is_the_complete_picker_catalog(monkeypatch):
+    monkeypatch.setenv("ASF_LLM_PROVIDER", "azure_openai")
+    monkeypatch.setenv("ASF_MODELS", json.dumps([
+        {"id": "primary", "label": "Primary", "provider_type": "openai_compatible", "base_url": "https://groq.example/v1", "model": "oss-model"},
+        {"id": "Mid-Level", "label": "GPT-5.3", "provider_type": "azure_openai", "endpoint": "https://resource.openai.azure.com/", "model": "deployment", "api_version": "v1"},
+    ]))
+
+    assert [profile["id"] for profile in llm_provider.model_profiles()] == ["primary", "Mid-Level"]
+    assert llm_provider.active_model_id() == "primary"
+
+
 def test_create_agent_optional_search_tool_is_only_registered_when_configured(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)

@@ -1,7 +1,7 @@
 const $ = (selector, root=document) => root.querySelector(selector);
 const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state = {view:'chat', skills:[], selected:null, busy:false, lastRequest:'', providerProfiles:{}};
+const state = {view:'chat', skills:[], selected:null, busy:false, lastRequest:'', providerProfiles:{}, models:[], activeModelId:null, creatingModelProfile:false};
 
 async function api(url, options={}) {
   const response = await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});
@@ -17,6 +17,8 @@ function selectView(view) {
   $$('.nav-item').forEach(item=>item.classList.toggle('active',item.dataset.view===view));
   $('#page-title').textContent=view==='chat'?'Chat':'Skills';
   $('#page-eyebrow').textContent=view==='chat'?'WORKSPACE / CONVERSATION':'CAPABILITY MANAGEMENT / LIBRARY';
+  $('#model-picker-wrap').classList.toggle('hidden',view!=='chat');
+  $('#model-switch-status').classList.toggle('hidden',view!=='chat');
   if(view==='skills') loadSkills();
 }
 
@@ -77,6 +79,7 @@ function addActivity(messageNode, events, open=false){
 async function sendMessage(text) {
   text=text.trim(); if(!text||state.busy)return;
   state.busy=true; state.lastRequest=text;
+  updateModelPickerState();
   addMessage('user',text);
   const assistant=addMessage('assistant','');
   const bubble=$('.response-content',assistant);bubble.innerHTML='<span class="stream-placeholder">✳ Working…</span>';
@@ -91,7 +94,7 @@ async function sendMessage(text) {
     pending+=decoder.decode();if(pending.trim()){const line=pending.split('\n').find(l=>l.startsWith('data: '));if(line)handleEvent(JSON.parse(line.slice(6)))}
     if(!events.length)addActivity(assistant,[{type:'status',message:'Request completed'}]);
   } catch(error) {bubble.innerHTML=formatMessage(`Request failed: ${error.message}`);addActivity(assistant,[{type:'error',message:error.message}],true)}
-  finally {state.busy=false;$('#chat-input').focus()}
+  finally {state.busy=false;updateModelPickerState();$('#chat-input').focus()}
 }
 
 function showSkillOffer(messageNode,request){
@@ -178,29 +181,133 @@ async function config() {
   $('#config-banner').classList.toggle('hidden',c.llm_configured);
   $('#config-copy').textContent='Choose an OpenAI-compatible endpoint or Azure OpenAI, then provide its key and model deployment.';
   state.providerProfiles={openai_compatible:c.openai_compatible,azure_openai:c.azure_openai};
-  $('#provider-type').value=c.provider_type;
-  showProviderProfile(c.provider_type);
+  state.models=c.models||[];
+  state.activeModelId=c.active_model_id;
+  renderModelPicker();
+  populateSettingsProfiles(c.active_model_id);
 }
-function showProviderProfile(providerType) {
+function renderModelPicker() {
+  const picker=$('#chat-model-picker');
+  picker.replaceChildren();
+  for(const model of state.models){
+    const option=document.createElement('option');
+    option.value=model.id;
+    option.textContent=model.configured?model.label:`${model.label} · configure key`;
+    option.disabled=!model.configured;
+    picker.append(option);
+  }
+  if(!state.models.length){picker.add(new Option('No model profiles',''));}
+  picker.value=state.activeModelId||'';
+  updateModelPickerState();
+}
+function updateModelPickerState() {
+  const picker=$('#chat-model-picker');
+  if(picker)picker.disabled=state.busy||state.models.filter(model=>model.configured).length<2;
+}
+$('#chat-model-picker').addEventListener('change',async event=>{
+  const modelId=event.target.value;
+  const previous=state.activeModelId;
+  $('#model-switch-status').textContent='Switching model…';
+  event.target.disabled=true;
+  try{
+    const selected=await api('/api/config/model',{method:'PUT',body:JSON.stringify({model_id:modelId})});
+    await config();
+    $('#model-switch-status').textContent=`Using ${selected.label}`;
+  }catch(error){
+    event.target.value=previous||'';
+    $('#model-switch-status').textContent=`Model switch failed: ${error.message}`;
+  }finally{updateModelPickerState()}
+});
+function populateSettingsProfiles(selectedId) {
+  const target=$('#profile-target');
+  target.replaceChildren();
+  const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='Choose a profile';target.append(placeholder);
+  for(const profile of state.models){
+    const option=document.createElement('option');
+    option.value=profile.id;
+    option.textContent=`${profile.label} · ${profile.provider_type==='azure_openai'?'Azure':'OpenAI-compatible'}${profile.configured?'':' · setup needed'}`;
+    target.append(option);
+  }
+  if(selectedId&&state.models.some(profile=>profile.id===selectedId))target.value=selectedId;
+  showProviderProfile(target.value);
+}
+function showProviderProfile(profileId) {
+  const profile=state.models.find(item=>item.id===profileId)||{};
+  const providerType=profile.provider_type||'openai_compatible';
   const azure=providerType==='azure_openai';
-  const profile=state.providerProfiles[providerType]||{};
   $('#provider-url-label').textContent=azure?'Azure resource endpoint':'Base URL';
   $('#provider-url').placeholder=azure?'https://your-resource.openai.azure.com/':'https://api.openai.com/v1';
   $('#provider-key-label').textContent=azure?'Azure OpenAI API key':'API key';
   $('#provider-model-label').textContent=azure?'Azure deployment name':'Model name';
   $('#provider-model').placeholder=azure?'gpt-5.3-chat':'gpt-4o-mini';
-  $('#provider-url').value=profile.base_url||'';
-  $('#provider-model').value=profile.model||'';
+  $('#provider-type').value=providerType;
+  $('#provider-id').value=profile.id||'';
+  $('#provider-id').disabled=!state.creatingModelProfile;
+  $('#provider-label').value=profile.label||'';
+  $('#provider-url').value=profile.base_url||(state.providerProfiles[providerType]||{}).base_url||'';
+  $('#provider-model').value=profile.model||(state.providerProfiles[providerType]||{}).model||'';
+  $('#provider-key-env').value=profile.api_key_env||(azure?'AZURE_OPENAI_API_KEY':'OPENAI_API_KEY');
   $('#provider-api-version').value=profile.api_version||'2024-08-01-preview';
   $('#azure-version-field').classList.toggle('hidden',!azure);
   $('#azure-note').classList.toggle('hidden',!azure);
 }
+function addModelProfile() {
+  state.creatingModelProfile=true;
+  const target=$('#profile-target');
+  target.value='';
+  $('#provider-id').disabled=false;
+  $('#provider-id').value='';
+  $('#provider-label').value='';
+  $('#provider-type').value='openai_compatible';
+  $('#provider-url').value='';
+  $('#provider-url').placeholder='https://provider.example/v1';
+  $('#provider-key').value='';
+  $('#provider-key-env').value='NEW_MODEL_API_KEY';
+  $('#provider-model').value='';
+  $('#provider-api-version').value='v1';
+  $('#azure-version-field').classList.add('hidden');
+  $('#azure-note').classList.add('hidden');
+  $('#settings-result').textContent='Enter a unique profile ID, endpoint, model/deployment, and API key variable.';
+}
 // A model may be configured in the browser before the updated bundle or config
 // response arrives. Recheck when the tab returns to the foreground.
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)config().catch(()=>{})});
-$('#open-settings').onclick=()=>$('#settings-dialog').showModal();
+$('#open-settings').onclick=async()=>{state.creatingModelProfile=false;await config();$('#settings-dialog').showModal()};
 $('#close-settings').onclick=()=>$('#settings-dialog').close();
-$('#provider-type').addEventListener('change',event=>showProviderProfile(event.target.value));
-$('#settings-form').addEventListener('submit',async e=>{e.preventDefault();const result=$('#settings-result');result.textContent='Saving…';try{const c=await api('/api/config/provider',{method:'PUT',body:JSON.stringify({provider_type:$('#provider-type').value,base_url:$('#provider-url').value,api_key:$('#provider-key').value,model:$('#provider-model').value,api_version:$('#provider-api-version').value})});result.textContent=`Connected ${c.provider_type==='azure_openai'?'Azure deployment':'endpoint'} saved for ${c.model}.`;$('#provider-key').value='';await config();setTimeout(()=>$('#settings-dialog').close(),700)}catch(error){result.textContent=error.message}});
+$('#profile-target').addEventListener('change',event=>{state.creatingModelProfile=false;showProviderProfile(event.target.value)});
+$('#add-model-profile').addEventListener('click',addModelProfile);
+$('#provider-type').addEventListener('change',event=>{
+  const azure=event.target.value==='azure_openai';
+  $('#provider-url-label').textContent=azure?'Azure resource endpoint':'Base URL';
+  $('#provider-key-label').textContent=azure?'Azure OpenAI API key':'API key';
+  $('#provider-model-label').textContent=azure?'Azure deployment name':'Model name';
+  $('#azure-version-field').classList.toggle('hidden',!azure);
+  $('#azure-note').classList.toggle('hidden',!azure);
+  if(state.creatingModelProfile||!$('#provider-key-env').value||['OPENAI_API_KEY','AZURE_OPENAI_API_KEY'].includes($('#provider-key-env').value))$('#provider-key-env').value=azure?'AZURE_OPENAI_API_KEY':'OPENAI_API_KEY';
+});
+$('#settings-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const result=$('#settings-result');result.textContent='Saving profile…';
+  const modelId=$('#profile-target').value;
+  const selected=state.models.find(profile=>profile.id===modelId);
+  try{
+    let c;
+    if(state.creatingModelProfile||selected&&!selected.legacy){
+      const creating=state.creatingModelProfile;
+      c=await api('/api/config/model-profile',{method:creating?'POST':'PUT',body:JSON.stringify({
+        model_id:creating?$('#provider-id').value:modelId,create:creating,label:$('#provider-label').value,provider_type:$('#provider-type').value,
+        base_url:$('#provider-url').value,api_key:$('#provider-key').value,api_key_env:$('#provider-key-env').value,
+        model:$('#provider-model').value,api_version:$('#provider-api-version').value
+      })});
+    }else{
+      c=await api('/api/config/provider',{method:'PUT',body:JSON.stringify({
+        provider_type:$('#provider-type').value,base_url:$('#provider-url').value,api_key:$('#provider-key').value,
+        model:$('#provider-model').value,api_version:$('#provider-api-version').value
+      })});
+    }
+    result.textContent=`Saved ${c.label||c.model} profile. It will be used for the next chat request.`;
+    state.creatingModelProfile=false;$('#provider-key').value='';await config();setTimeout(()=>$('#settings-dialog').close(),900);
+  }catch(error){result.textContent=error.message}
+});
 $('#system-state').addEventListener('click',()=>$('#settings-dialog').showModal());
 config().catch(()=>{});loadSkills().catch(()=>{});
