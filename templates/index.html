@@ -3,12 +3,14 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0a0d12"><title>Agent Skill Foundry</title>
-  <link rel="stylesheet" href="/static/styles.css?v=5">
+  <link rel="icon" type="image/svg+xml" href="/static/asf-mark.svg?v=1">
+  <link rel="stylesheet" href="/static/styles.css?v=6">
+  <style>.brand-mark{display:block;width:36px;height:36px;border:0;background:none;border-radius:10px;object-fit:cover}.welcome-glyph{padding:0;overflow:hidden}.welcome-glyph img{width:100%;height:100%;display:block;object-fit:cover}</style>
 </head>
 <body>
   <div class="shell">
     <aside class="rail">
-      <a class="brand" href="#chat" aria-label="Agent Skill Foundry home"><span class="brand-mark">✳</span><span>ASF<span class="brand-caption">LOCAL WORKSPACE</span></span></a>
+      <a class="brand" href="#chat" aria-label="Agent Skill Foundry home"><img class="brand-mark" src="/static/asf-mark.svg" alt=""><span>ASF<span class="brand-caption">LOCAL WORKSPACE</span></span></a>
       <div class="rail-label">WORKSPACE</div>
       <nav class="nav" aria-label="Main navigation">
         <button class="nav-item active" data-view="chat"><span class="nav-icon">◉</span> Chat <span class="nav-key">01</span></button>
@@ -17,10 +19,10 @@
       <div class="rail-bottom"><div class="system-card"><span class="pulse"></span><div><strong>Local system</strong><small id="system-state">Checking configuration…</small></div></div><div class="rail-footer">CAPABILITY MANAGEMENT<br>VERSION 0.1 · LOCAL ONLY</div></div>
     </aside>
     <main class="main">
-      <header class="topbar"><div><span class="eyebrow" id="page-eyebrow">WORKSPACE / CONVERSATION</span><h1 id="page-title">Chat</h1></div><div class="top-actions"><span class="local-badge"><span></span>LOCAL</span><button id="clear-chat" class="button button-quiet"><span>↺</span> Clear conversation</button></div></header>
+      <header class="topbar"><div><span class="eyebrow" id="page-eyebrow">WORKSPACE / CONVERSATION</span><h1 id="page-title">Chat</h1></div><div class="top-actions"><span class="local-badge"><span></span>LOCAL</span><a class="button button-quiet" href="/logs">Logs</a><button id="clear-chat" class="button button-quiet"><span>↺</span> Clear conversation</button></div></header>
       <section id="config-banner" class="config-banner hidden" role="status"><span class="config-icon">!</span><div><strong>Set up your model provider</strong><p id="config-copy">Add an OpenAI-compatible endpoint, key, and model.</p></div><button class="button" id="open-settings">Configure</button></section>
       <section id="chat-view" class="view chat-view">
-        <div id="messages" class="messages" aria-live="polite"><div class="welcome"><div class="welcome-glyph">✳</div><span class="eyebrow">YOUR CAPABILITY WORKSPACE</span><h2>What are we working on?</h2><p>Ask a question, use live web search, or put an approved skill to work. When a reusable capability is missing, we’ll shape one together.</p><div class="suggestions"><button data-prompt="Search the web for the latest Python 3.14 release notes and cite your sources."><span>↗</span> Search current information</button><button data-prompt="Help me make a reusable capability for a task I do often."><span>✳</span> Build a reusable skill</button></div></div></div>
+        <div id="messages" class="messages" aria-live="polite"><div class="welcome"><div class="welcome-glyph"><img src="/static/asf-mark.svg" alt="Agent Skill Foundry"></div><span class="eyebrow">YOUR CAPABILITY WORKSPACE</span><h2>What are we working on?</h2><p>Ask a question, use live web search, or put an approved skill to work. When a reusable capability is missing, we’ll shape one together.</p><div class="suggestions"><button data-prompt="Search the web for the latest Python 3.14 release notes and cite your sources."><span>↗</span> Search current information</button><button data-prompt="Help me make a reusable capability for a task I do often."><span>✳</span> Build a reusable skill</button></div></div></div>
         <div id="draft-host"></div>
         <form id="chat-form" class="composer"><div class="composer-meta"><span><span class="composer-dot"></span> Agent Skill Foundry</span><span>ENTER TO SEND <b>·</b> SHIFT + ENTER FOR NEW LINE</span></div><div class="composer-box"><label class="sr-only" for="chat-input">Message the agent</label><textarea id="chat-input" rows="2" placeholder="Ask a question or describe a task…" required></textarea><button class="send-button" aria-label="Send message">↑</button></div><div class="composer-bottom"><span>Responses may take a few moments</span><span><kbd>↵</kbd> send</span></div></form>
       </section>
@@ -28,7 +30,7 @@
       <footer class="app-footer"><span>AGENT SKILL FOUNDRY <span class="footer-sep">/</span> LOCAL FIRST</span><span>SKILLS ARE SAVED <span class="footer-sep">·</span> CHAT IS VOLATILE</span></footer>
     </main>
   </div>
-  <dialog id="settings-dialog" class="settings-dialog"><form id="settings-form"><div class="library-heading"><div><span class="eyebrow">MODEL PROVIDER</span><h2>Connection settings</h2></div><button type="button" id="close-settings" class="button">Close</button></div><p class="subtle">Use any endpoint that implements the OpenAI Chat Completions API.</p><div class="field"><label for="provider-url">Base URL</label><input id="provider-url" type="url" placeholder="https://api.openai.com/v1" required></div><div class="field"><label for="provider-key">API key</label><input id="provider-key" type="password" placeholder="Saved locally in .env" autocomplete="new-password"></div><div class="field"><label for="provider-model">Model name</label><input id="provider-model" placeholder="gpt-4o-mini" required></div><p id="settings-result" class="subtle"></p><button class="button button-primary" type="submit">Save and connect</button></form></dialog>
-  <script src="/static/app.js?v=7" defer></script>
+  <dialog id="settings-dialog" class="settings-dialog"><form id="settings-form"><div class="library-heading"><div><span class="eyebrow">MODEL PROVIDER</span><h2>Connection settings</h2></div><button type="button" id="close-settings" class="button">Close</button></div><p class="subtle">Choose your usual OpenAI-compatible endpoint or switch to Azure OpenAI for demos.</p><div class="field"><label for="provider-type">Provider</label><select id="provider-type"><option value="openai_compatible">OpenAI-compatible endpoint</option><option value="azure_openai">Azure OpenAI (demo)</option></select></div><div class="field"><label id="provider-url-label" for="provider-url">Base URL</label><input id="provider-url" type="url" placeholder="https://api.openai.com/v1" required></div><div class="field"><label for="provider-key" id="provider-key-label">API key</label><input id="provider-key" type="password" placeholder="Saved locally in .env" autocomplete="new-password"></div><div class="field"><label id="provider-model-label" for="provider-model">Model name</label><input id="provider-model" placeholder="gpt-4o-mini" required></div><div id="azure-version-field" class="field hidden"><label for="provider-api-version">Azure API version</label><input id="provider-api-version" placeholder="2024-08-01-preview"></div><p id="azure-note" class="subtle hidden">GPT-5 needs an API version that supports max_completion_tokens. Try v1 for the Azure /openai/v1 route, or select a newer dated version supported by your deployment.</p><p id="settings-result" class="subtle"></p><button class="button button-primary" type="submit">Save and connect</button></form></dialog>
+  <script src="/static/app.js?v=8" defer></script>
 </body>
 </html>

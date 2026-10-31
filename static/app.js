@@ -1,7 +1,7 @@
 const $ = (selector, root=document) => root.querySelector(selector);
 const $$ = (selector, root=document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const state = {view:'chat', skills:[], selected:null, busy:false, lastRequest:''};
+const state = {view:'chat', skills:[], selected:null, busy:false, lastRequest:'', providerProfiles:{}};
 
 async function api(url, options={}) {
   const response = await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});
@@ -174,16 +174,33 @@ function renderDraft(draft) {
 
 async function config() {
   const c=await api('/api/config');
-  $('#system-state').textContent=c.llm_configured?`Model ready · ${c.model}`:'Model setup needed';
+  $('#system-state').textContent=c.llm_configured?`Model ready · ${c.provider_type==='azure_openai'?'Azure demo · ':''}${c.model}`:'Model setup needed';
   $('#config-banner').classList.toggle('hidden',c.llm_configured);
-  $('#config-copy').textContent='Add an OpenAI-compatible endpoint, key, and model to enable chat.';
-  $('#provider-url').value=c.base_url;$('#provider-model').value=c.model;
+  $('#config-copy').textContent='Choose an OpenAI-compatible endpoint or Azure OpenAI, then provide its key and model deployment.';
+  state.providerProfiles={openai_compatible:c.openai_compatible,azure_openai:c.azure_openai};
+  $('#provider-type').value=c.provider_type;
+  showProviderProfile(c.provider_type);
+}
+function showProviderProfile(providerType) {
+  const azure=providerType==='azure_openai';
+  const profile=state.providerProfiles[providerType]||{};
+  $('#provider-url-label').textContent=azure?'Azure resource endpoint':'Base URL';
+  $('#provider-url').placeholder=azure?'https://your-resource.openai.azure.com/':'https://api.openai.com/v1';
+  $('#provider-key-label').textContent=azure?'Azure OpenAI API key':'API key';
+  $('#provider-model-label').textContent=azure?'Azure deployment name':'Model name';
+  $('#provider-model').placeholder=azure?'gpt-5.3-chat':'gpt-4o-mini';
+  $('#provider-url').value=profile.base_url||'';
+  $('#provider-model').value=profile.model||'';
+  $('#provider-api-version').value=profile.api_version||'2024-08-01-preview';
+  $('#azure-version-field').classList.toggle('hidden',!azure);
+  $('#azure-note').classList.toggle('hidden',!azure);
 }
 // A model may be configured in the browser before the updated bundle or config
 // response arrives. Recheck when the tab returns to the foreground.
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)config().catch(()=>{})});
 $('#open-settings').onclick=()=>$('#settings-dialog').showModal();
 $('#close-settings').onclick=()=>$('#settings-dialog').close();
-$('#settings-form').addEventListener('submit',async e=>{e.preventDefault();const result=$('#settings-result');result.textContent='Saving…';try{const c=await api('/api/config/provider',{method:'PUT',body:JSON.stringify({base_url:$('#provider-url').value,api_key:$('#provider-key').value,model:$('#provider-model').value})});result.textContent=`Connected settings saved for ${c.model}.`;$('#provider-key').value='';await config();setTimeout(()=>$('#settings-dialog').close(),700)}catch(error){result.textContent=error.message}});
+$('#provider-type').addEventListener('change',event=>showProviderProfile(event.target.value));
+$('#settings-form').addEventListener('submit',async e=>{e.preventDefault();const result=$('#settings-result');result.textContent='Saving…';try{const c=await api('/api/config/provider',{method:'PUT',body:JSON.stringify({provider_type:$('#provider-type').value,base_url:$('#provider-url').value,api_key:$('#provider-key').value,model:$('#provider-model').value,api_version:$('#provider-api-version').value})});result.textContent=`Connected ${c.provider_type==='azure_openai'?'Azure deployment':'endpoint'} saved for ${c.model}.`;$('#provider-key').value='';await config();setTimeout(()=>$('#settings-dialog').close(),700)}catch(error){result.textContent=error.message}});
 $('#system-state').addEventListener('click',()=>$('#settings-dialog').showModal());
 config().catch(()=>{});loadSkills().catch(()=>{});

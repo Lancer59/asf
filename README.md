@@ -19,7 +19,17 @@ python run.py
 
 Open http://127.0.0.1:8000. The Skills library and chat UI work without credentials. Configure any OpenAI-compatible Chat Completions endpoint, API key, and model from Settings; credentials are stored in the local `.env`. Web search is optional and requires `TAVILY_API_KEY`. Never commit `.env`.
 
+Settings can also switch the active provider to **Azure OpenAI (demo)**. The Azure endpoint, API key, API version, and deployment are stored separately from the normal OpenAI-compatible profile; switching back restores that profile. Azure uses `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION`, and `AZURE_OPENAI_DEPLOYMENT_NAME`. For newer Azure GPT deployments, the API version can be set to `v1`, which uses the Azure `/openai/v1` endpoint.
+
 If you use `uv`, `uv sync` creates `.venv`, then copy `.env.example` to `.env` and start with `uv run python run.py`. `requirements.in` is the human-maintained dependency input and `requirements.txt` is its pip-compatible install output. Regenerate it after package changes with `pip-compile requirements.in -o requirements.txt` when PyPI is reachable.
+
+## Logs
+
+ASF logs each HTTP request, agent run, tool start/finish, skill test outcome, and skill lifecycle change to the console and to `data/logs/asf.log`. Each log file rotates at 20 MiB and keeps five backup files. Open **Logs** in the chat header or visit `/logs` to inspect the logs. The dashboard defaults to the newest file and can download a standalone HTML snapshot with a notice that its contents are generated from logs. Every HTTP response includes an `X-Request-ID` header; use that value to find all related log lines. The log records operation metadata, status, and duration, but omits chat text, API keys, test inputs, skill source, and raw tool outputs. Provider error details are returned in the chat response but logs record only the error type.
+
+The dashboard also summarizes HTTP request volume/failures/average duration and AI activity across the full selected file: agent runs and their outcomes, model calls and failures, provider-reported prompt/completion/total tokens, tool runs and failures, per-tool run/failure counts, and model calls without reported token usage. Token counts depend on what the configured OpenAI-compatible endpoint returns; missing counts are shown as unavailable rather than estimated. The table row limit does not truncate the summary metrics.
+
+Set `LOG_LEVEL=DEBUG` in `.env` for more detailed event metadata. Set `ASF_LOG_FILE=` to disable the file log while keeping console logging. The default log directory is Git-ignored; if you choose a custom file path, keep it outside version control.
 
 ## Automated tests
 
@@ -32,7 +42,7 @@ python -m pytest -q
 
 The tests cover provider configuration, chat and skill API behavior, draft review and approval, skill versioning and audit records, agent skill selection and progress labels, and Python sandbox outcomes. Tests use temporary SQLite databases and mock provider and Docker calls, so the default suite does not need API credentials, a running model endpoint, web search, or Docker Engine. The default route checks exercise the SSE response contract without opening a local socket server.
 
-An opt-in live test starts the local app, sends a real request to the configured model, and verifies that the model calls the approved-skills tool and completes the SSE response. This also exercises actual async event streaming through HTTP. It can incur provider usage charges:
+An opt-in live test sends a real request through ASF's configured agent and verifies that the model calls the approved-skills tool and receives a tool result. It can incur provider usage charges:
 
 ```powershell
 $env:ASF_LIVE_TESTS = "1"

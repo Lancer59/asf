@@ -100,12 +100,30 @@ This topology is designed for a single local user. It currently has no authentic
 | `OPENAI_COMPAT_API_KEY` | Compatibility alias for API key. | Read if `OPENAI_API_KEY` is absent. |
 | `LLM_MODEL` | Provider model identifier. | `gpt-4o-mini`. |
 | `GROQ_API_KEY` | Legacy provider key fallback. | If used without an explicit base URL/key, code selects Groq's OpenAI-compatible URL. |
+| `ASF_LLM_PROVIDER` | Active provider profile. | `openai_compatible` by default; choose `azure_openai` for Azure demos. |
+| `AZURE_OPENAI_API_KEY` | Azure resource key. | Kept separate from `OPENAI_API_KEY`; never returned by configuration API. |
+| `AZURE_OPENAI_ENDPOINT` | Azure resource endpoint. | Defaults to the endpoint supplied in `.env.example`. |
+| `AZURE_OPENAI_API_VERSION` | Azure data-plane API version. | Defaults to `2024-08-01-preview`; `v1` uses the Azure OpenAI v1 route. |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | Azure model deployment name. | Defaults to `gpt-5.3-chat`; set this to the deployment name in the Azure resource. |
+| `AZURE_OPENAI_REASONING_EFFORT` | Optional GPT reasoning effort. | Empty leaves the model default; provider/model support varies. |
 | `TAVILY_API_KEY` | Enables the web search tool. | Optional; without it, chat can still run. |
 | `PORT` | Local HTTP port. | `8000`. |
+| `LOG_LEVEL` | Minimum ASF log level. | `INFO`; use `DEBUG` for more event metadata. |
+| `ASF_LOG_FILE` | Persistent log destination. | `data/logs/asf.log`; empty disables file logging but keeps console logs. |
 
-The Settings endpoint accepts a base URL, API key, and model name. It requires an `http://` or `https://` URL, non-empty model, and key (the existing environment key may be reused if the submitted key is blank). It strips surrounding whitespace and trailing slashes from the base URL, writes `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `LLM_MODEL` into the project `.env`, and updates the current process environment. It does not make a test request to verify that the credentials, URL, and model work together.
+The Settings endpoint accepts a provider type, endpoint, API key, and model/deployment name. It requires an `http://` or `https://` URL, non-empty model, and key (the active provider's existing key may be reused if the submitted key is blank). OpenAI-compatible settings write `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `LLM_MODEL`; Azure settings write the separate `AZURE_OPENAI_*` variables. Selecting one profile does not overwrite the other profile's credentials. Both are saved in the project `.env` and take effect in the running process immediately. The endpoint does not make a test request to verify that credentials, endpoint, API version, and deployment work together.
 
-Provider compatibility is mediated through `ChatOpenAI`; a provider must support the API features exercised by Deep Agents. Model/API compatibility, tool calling, context size, and structured output behavior are provider-dependent.
+OpenAI-compatible providers use `ChatOpenAI`; Azure dated API versions use `AzureChatOpenAI`. Setting Azure API version to `v1` uses `ChatOpenAI` with `{AZURE_OPENAI_ENDPOINT}/openai/v1` and the deployment name as its model identifier. GPT-5 Azure requests use `max_completion_tokens` and omit `temperature`; the token ceiling uses `LLM_MAX_TOKENS`. A dated API version that predates this parameter may be rejected by the endpoint, so select an API version supported by the deployment or `v1`. Model/API compatibility, tool calling, context size, and structured output behavior are provider-dependent.
+
+### Logging and request correlation
+
+ASF uses Python's standard logging package through `observability.py`. It writes to stdout and, by default, to `data/logs/asf.log`. Each file rotates at 20 MiB and retains five backups (`asf.log.1` through `asf.log.5`). The default log directory is Git-ignored. The `/logs` page (also linked from the chat header) lists the active and rotated files, sorted newest first, selects the newest by default, and displays up to 10,000 newest lines from the selected file. Its **Download HTML snapshot** action exports the loaded log lines and full-file AI summary to a standalone HTML file that includes a notice that the data was generated from local logs and may be incomplete or rotated; it is diagnostic output, not authoritative audit evidence. The dashboard reads only the configured log path and numbered backups managed by the rotating handler.
+
+A pure ASGI middleware creates a fresh UUID request ID for each HTTP request, stores it in a context variable, logs request start and completion with method, path, status, and duration, and returns the ID in the `X-Request-ID` response header. Because the middleware wraps the full ASGI response call, the ID stays available while SSE response bodies are generated. Query strings and request bodies are excluded from access logs.
+
+Application events include provider configuration changes (model and endpoint host only), agent start/end status and duration, each model-call status/duration and provider-reported prompt/completion/total tokens, tool start/end status and duration, sandbox availability and outcomes, source hash and duration for Python tests, draft review states, skill approvals/version numbers, deprecation, and audit actions. The dashboard aggregates HTTP request count/failures/average duration plus agent runs, model calls, per-tool run/failure counts, prompt/completion/total tokens, and calls without token usage across the full selected file; the table's row limit does not truncate these metrics. `ChatOpenAI(stream_usage=True)` requests usage for streaming responses; providers may omit it, so missing usage is marked unavailable and never estimated. Token cost is not calculated because prices vary by provider/model and are not supplied by the log event. API keys, prompts, user inputs, skill source, and raw tool outputs are not logged. Error paths log exception classes rather than exception messages to reduce the chance of logging provider or user data. The HTTP response may still contain a detailed error for the caller.
+
+Use `LOG_LEVEL=DEBUG` for more detailed metadata, or `ASF_LOG_FILE=` to disable persistent logging while retaining console output. When investigating an issue, copy the `X-Request-ID` value from the browser's Network response headers and search for that ID in the log file or use the dashboard search field.
 
 ## 5. Request and agent flows
 
@@ -268,14 +286,16 @@ python -m pytest -q
 
 Current coverage is organized as follows:
 
-- `tests/test_agent.py`: history compaction, task/skill intent detection, duplicate-offer matching, JSON proposal source, approved skill execution delegation, progress labels.
-- `tests/test_app_routes.py`: provider validation/persistence, home/config state, chat request validation/SSE response contract/history clearing, skill route errors, draft edit/test/review flows and acceptance gates.
+- `tests/test_agent.py`: history compaction, task/skill intent detection, duplicate-offer matching, JSON proposal source, approved skill execution delegation, progress labels, and OpenAI-compatible/Azure dated/v1 model setup.
+- `tests/test_app_routes.py`: OpenAI-compatible and Azure profile validation/persistence, separate credential preservation, home/config state, chat request validation/SSE response contract/history clearing, skill route errors, draft edit/test/review flows and acceptance gates.
 - `tests/test_skill_lifecycle.py`: proposal defaults, SQLite promotion, files/frontmatter, search, version history, failed/pass promotion, update, deprecation, audit details.
 - `tests/test_skill_execution.py`: successful runner parsing and captured prints, empty/no-Docker/daemon-unavailable states, runtime exceptions, timeout, malformed runner envelope, restrictive Docker arguments, approved Markdown exposure, slug/frontmatter naming.
+- `tests/test_observability.py`: file logging format, request ID correlation, response header injection, lifecycle event coverage, and query-string exclusion.
+- `tests/test_log_dashboard.py`: newest-first log selection, generated-data warning and controls, reverse chronological parsing, full-file AI and per-tool metrics with truncated display rows, and rejection of unlisted paths.
 - `tests/conftest.py`: temporary project/database isolation and a direct endpoint-function adapter.
-- `tests/integration/test_live_chat.py`: opt-in real provider request against a child Uvicorn server; asserts that the model calls `list_approved_skills`, emits tool lifecycle events over SSE, and completes the response.
+- `tests/integration/test_live_chat.py`: opt-in real provider request through ASF's configured agent; asserts that the model calls `list_approved_skills`, receives a tool result, and returns a response.
 
-The default suite mocks provider and Docker subprocess boundaries; it requires neither credentials nor a live Docker daemon and uses temporary SQLite storage for lifecycle and execution-record checks. Its route tests call endpoint functions directly to avoid a Windows socket-based test client. The opt-in live suite exercises the app through real HTTP and the configured model; it requires provider credentials, network access, and may incur usage charges. Enable it with `$env:ASF_LIVE_TESTS = "1"` in PowerShell or `set ASF_LIVE_TESTS=1` in `cmd.exe`, then run `python -m pytest -m live -q`. Latest verified offline result before adding the live suite: **36 passed**. Run `python -m pytest -q` to verify the current default suite; live tests are skipped unless explicitly enabled.
+The default suite mocks provider and Docker subprocess boundaries; it requires neither credentials nor a live Docker daemon and uses temporary SQLite storage for lifecycle and execution-record checks. Its route tests call endpoint functions directly to avoid a Windows socket-based test client. The opt-in live suite makes a real provider request through ASF's production agent and requires provider credentials and network access; it may incur usage charges. Enable it with `$env:ASF_LIVE_TESTS = "1"` in PowerShell or `set ASF_LIVE_TESTS=1` in `cmd.exe`, then run `python -m pytest -m live -q`. The live test checks model-to-tool calling but does not run the HTTP SSE route. Latest verification: **55 offline tests passed, 1 skipped** (`python -m pytest -q --basetemp .pytest-tmp` in the restricted workspace); `pip check` reported no broken requirements.
 
 ## 11. Security, privacy, and operational boundaries
 

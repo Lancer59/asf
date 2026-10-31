@@ -1,6 +1,10 @@
 import ast
+import json
+import sys
+from types import ModuleType, SimpleNamespace
 
 import agent
+import llm_provider
 import app
 import skills
 
@@ -88,5 +92,287 @@ def test_tool_progress_labels_cover_search_failure_and_sandbox_unavailable(monke
     assert agent.tool_event_label("other", "end") == "Tool finished"
     assert agent.tool_event_label("run_approved_skill", "end", '{"status":"sandbox_unavailable"}') == "Approved Skill was not run · sandbox unavailable"
     assert agent.tool_event_label("run_approved_skill", "end", '{"success":false,"status":"failed"}') == "Approved Skill execution failed"
+
+
+def test_create_agent_requires_provider_key(monkeypatch):
+    for name in ("OPENAI_API_KEY", "OPENAI_COMPAT_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    instance, error = agent.create_agent()
+
+    assert instance is None
+    assert "add an API key" in error
+
+
+def test_create_agent_configures_compatible_model_and_registers_tools(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "321")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options):
+            captured["model_options"] = options
+
+    def create_deep_agent(**options):
+        captured["agent_options"] = options
+        return "fake-agent"
+
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = create_deep_agent
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+    monkeypatch.setattr(agent, "approved_skill_directories", lambda: ["/skills/approved/"])
+    monkeypatch.setattr(agent, "approved_skill_files", lambda: {})
+    monkeypatch.setattr(agent.skills, "list_skills", lambda **kwargs: [])
+
+    instance, error = agent.create_agent()
+
+    assert error is None
+    assert instance == "fake-agent"
+    assert captured["model_options"] == {
+        "model": "test-model", "api_key": "test-key", "temperature": 0,
+        "stream_usage": True, "max_tokens": 321, "base_url": "https://llm.example/v1",
+    }
+    options = captured["agent_options"]
+    assert options["skills"] == ["/skills/approved/"]
+    assert {tool.__name__ for tool in options["tools"]} == {
+        "list_approved_skills", "run_approved_skill", "propose_reusable_skill"
+    }
+    assert "call list_approved_skills first" in options["system_prompt"]
+    assert "Never claim code ran unless that tool returned success" in options["system_prompt"]
+
+
+def test_create_agent_uses_azure_deployment_without_touching_openai_profile(monkeypatch):
+    monkeypatch.setenv("ASF_LLM_PROVIDER", "azure_openai")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://servicedeskgpt.openai.azure.com/")
+    monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5.3-chat")
+    monkeypatch.setenv("OPENAI_API_KEY", "separate-openai-key")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    captured = {}
+
+    class FakeAzureChatOpenAI:
+        def __init__(self, **options): captured["model_options"] = options
+
+    def create_deep_agent(**options):
+        captured["agent_options"] = options
+        return "azure-agent"
+
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = create_deep_agent
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.AzureChatOpenAI = FakeAzureChatOpenAI
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+    monkeypatch.setattr(agent, "approved_skill_directories", lambda: [])
+    monkeypatch.setattr(agent, "approved_skill_files", lambda: {})
+    monkeypatch.setattr(agent.skills, "list_skills", lambda **kwargs: [])
+
+    instance, error = agent.create_agent()
+
+    assert error is None
+    assert instance == "azure-agent"
+    assert captured["model_options"] == {
+        "azure_endpoint": "https://servicedeskgpt.openai.azure.com",
+        "azure_deployment": "gpt-5.3-chat",
+        "api_version": "2024-08-01-preview",
+        "api_key": "azure-key",
+        "max_completion_tokens": 1200,
+        "stream_usage": True,
+    }
+    assert "temperature" not in captured["model_options"]
+    assert captured["agent_options"]["tools"]
+
+
+def test_azure_v1_profile_uses_openai_v1_endpoint(monkeypatch):
+    monkeypatch.setenv("ASF_LLM_PROVIDER", "azure_openai")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "azure-key")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://service.openai.azure.com/")
+    monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "v1")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT_NAME", "demo-deployment")
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options): captured.update(options)
+
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+
+    llm_provider.create_chat_model()
+
+    assert captured["model"] == "demo-deployment"
+    assert captured["base_url"] == "https://service.openai.azure.com/openai/v1"
+    assert captured["api_key"] == "azure-key"
+    assert captured["max_completion_tokens"] == 1200
+    assert "temperature" not in captured
+
+
+def test_create_agent_optional_search_tool_is_only_registered_when_configured(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_BASE_URL", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "search-key")
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options): pass
+
+    class FakeTavilySearch:
+        def __init__(self, **options): captured["search_options"] = options
+        def invoke(self, inputs): return {"answer": "summary", "results": [{"title": "A", "url": "https://example.com", "content": "snippet"}]}
+
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = lambda **options: captured.update(agent_options=options) or "fake-agent"
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    langchain_tavily = ModuleType("langchain_tavily")
+    langchain_tavily.TavilySearch = FakeTavilySearch
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+    monkeypatch.setitem(sys.modules, "langchain_tavily", langchain_tavily)
+    monkeypatch.setattr(agent, "approved_skill_directories", lambda: [])
+
+    instance, error = agent.create_agent()
+
+    assert instance == "fake-agent" and error is None
+    assert captured["search_options"] == {"max_results": 5}
+    tools = captured["agent_options"]["tools"]
+    assert tools[0].__name__ == "web_search"
+    assert json.loads(tools[0]("test query")) == {
+        "answer": "summary", "results": [{"title": "A", "url": "https://example.com", "snippet": "snippet"}]
+    }
+
+
+def test_agent_tool_closures_list_skills_propose_once_and_reject_unapproved_execution(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options): pass
+
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = lambda **options: captured.update(options=options) or "fake-agent"
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+    monkeypatch.setattr(agent.skills, "list_skills", lambda **kwargs: [{
+        "slug": "demo", "name": "Demo", "description": "A demo", "content": {"skill_type": "python", "inputs": {"x": {"type": "integer"}}}, "metadata": {"tags": ["sample"]}
+    }])
+    monkeypatch.setattr(agent, "approved_skill_directories", lambda: [])
+    agent.DRAFTS.clear()
+    _, error = agent.create_agent()
+    assert error is None
+    tools = {tool.__name__: tool for tool in captured["options"]["tools"]}
+    assert json.loads(tools["list_approved_skills"]()) == [{
+        "slug": "demo", "name": "Demo", "description": "A demo", "skill_type": "python", "inputs": {"x": {"type": "integer"}}, "tags": ["sample"]
+    }]
+    first = tools["propose_reusable_skill"]("Create one demo skill")
+    second = tools["propose_reusable_skill"]("This should not create another")
+    assert "Draft created" in first
+    assert "already created" in second
+    assert len(agent.DRAFTS) == 1
+    not_approved = json.loads(tools["run_approved_skill"]("missing", {"x": 1}))
+    assert not_approved["success"] is False
+    assert not_approved["error"] == "Approved skill not found."
+    agent.DRAFTS.clear()
+
+
+def test_invoke_agent_compacts_history_and_returns_model_tool_trace(monkeypatch):
+    import logging
+
+    recorded = {}
+    records = []
+    class Capture(logging.Handler):
+        def emit(self, record): records.append(record.getMessage())
+
+    handler = Capture()
+    agent.logger.addHandler(handler)
+    final_message = SimpleNamespace(type="ai", content="Answer from the tool", tool_calls=[])
+    tool_message = SimpleNamespace(type="tool", content="[]", tool_calls=[], name="list_approved_skills")
+
+    class FakeAgent:
+        def invoke(self, payload):
+            recorded["payload"] = payload
+            return {"messages": [tool_message, final_message]}
+
+    monkeypatch.setattr(agent, "create_agent", lambda: (FakeAgent(), None))
+    monkeypatch.setattr(agent, "approved_skill_files", lambda: {"/skills/approved/demo/SKILL.md": "demo"})
+    history = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "x" * 1700}]
+
+    try:
+        result = agent.invoke_agent("current task", history)
+    finally:
+        agent.logger.removeHandler(handler)
+
+    assert result["reply"] == "Answer from the tool"
+    assert result["steps"][-1]["content"] == "Answer from the tool"
+    payload = recorded["payload"]
+    assert payload["messages"][-1] == {"role": "user", "content": "current task"}
+    assert payload["messages"][1]["content"].endswith("[earlier content trimmed]")
+    assert payload["files"] == {"/skills/approved/demo/SKILL.md": "demo"}
+    assert any("agent_tool_finished tool=list_approved_skills status=completed" in line for line in records)
+
+
+def test_token_usage_extractor_supports_langchain_and_openai_metadata():
+    assert agent._extract_token_usage({"usage_metadata": {"input_tokens": 12, "output_tokens": 7, "total_tokens": 19}}) == (12, 7, 19)
+    assert agent._extract_token_usage({"response_metadata": {"token_usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}}}) == (3, 4, 7)
+    assert agent._extract_token_usage({}) == (None, None, None)
+
+
+def test_agent_stream_logs_model_usage_and_tool_durations(monkeypatch):
+    import logging
+    from types import SimpleNamespace
+
+    records = []
+    class Capture(logging.Handler):
+        def emit(self, record): records.append(record.getMessage())
+
+    def run_immediate(coroutine):
+        try:
+            coroutine.send(None)
+        except StopIteration as result:
+            return result.value
+        raise AssertionError("Fake stream unexpectedly suspended")
+
+    async def emit(_event):
+        return None
+
+    handler = Capture()
+    agent.logger.addHandler(handler)
+
+    class FakeAgent:
+        async def astream_events(self, *_args, **_kwargs):
+            events = [
+                {"event": "on_chat_model_start", "run_id": "m1", "name": "ChatOpenAI", "data": {}},
+                {"event": "on_chat_model_end", "run_id": "m1", "name": "ChatOpenAI", "data": {"output": SimpleNamespace(usage_metadata={"input_tokens": 11, "output_tokens": 5, "total_tokens": 16})}},
+                {"event": "on_tool_start", "run_id": "t1", "name": "test_tool", "data": {"input": {}}},
+                {"event": "on_tool_end", "run_id": "t1", "name": "test_tool", "data": {"output": "ok"}},
+                {"event": "on_tool_start", "run_id": "t2", "name": "broken_tool", "data": {"input": {}}},
+                {"event": "on_tool_error", "run_id": "t2", "name": "broken_tool", "data": {"error": ValueError("private detail")}},
+            ]
+            for event in events:
+                yield event
+
+    monkeypatch.setattr(agent, "create_agent", lambda: (FakeAgent(), None))
+    try:
+        run_immediate(agent.stream_agent("hello there", [], emit))
+    finally:
+        agent.logger.removeHandler(handler)
+
+    assert any("agent_model_call_finished" in line and "prompt_tokens=11" in line and "completion_tokens=5" in line for line in records)
+    assert any("agent_tool_finished tool=test_tool status=success" in line and "duration_ms=" in line for line in records)
+    assert any("agent_tool_finished tool=broken_tool status=error" in line and "error_type=ValueError" in line for line in records)
+    assert all("private detail" not in line for line in records)
+    assert any("agent_stream_finished status=success" in line and "model_calls=1" in line and "tool_runs=2" in line and "tool_failures=1" in line for line in records)
 
 

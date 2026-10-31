@@ -13,9 +13,19 @@ import app
 import skills
 
 
+@pytest.fixture(autouse=True)
+def default_model_provider(monkeypatch):
+    monkeypatch.setenv("ASF_LLM_PROVIDER", "openai_compatible")
+    for key in ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME"):
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture
 def isolated_project(tmp_path, monkeypatch):
     """Use a disposable SQLite database and approved-skill directory."""
+    monkeypatch.setenv("ASF_LLM_PROVIDER", "openai_compatible")
+    for key in ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(skills, "DB_PATH", tmp_path / "data" / "skills.sqlite")
     monkeypatch.setattr(skills, "APPROVED", tmp_path / "skills" / "approved")
     monkeypatch.setattr(app, "ROOT", tmp_path)

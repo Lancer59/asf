@@ -5,6 +5,10 @@ import skills
 def test_home_and_config_report_unconfigured_provider(client, monkeypatch):
     for key in ("OPENAI_API_KEY", "OPENAI_COMPAT_API_KEY", "GROQ_API_KEY", "TAVILY_API_KEY"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ASF_LLM_PROVIDER", "openai_compatible")
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT_NAME", raising=False)
     monkeypatch.setattr("shutil.which", lambda _: None)
 
     assert client.get("/").status_code == 200
@@ -27,9 +31,9 @@ def test_provider_config_validation_and_save(client, monkeypatch, isolated_proje
         "base_url": " https://llm.example/v1/ ", "model": " test-model ", "api_key": " secret "
     })
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "llm_configured": True, "base_url": "https://llm.example/v1", "model": "test-model"}
+    assert response.json() == {"ok": True, "llm_configured": True, "provider_type": "openai_compatible", "base_url": "https://llm.example/v1", "model": "test-model", "api_version": ""}
     assert (isolated_project / ".env").read_text(encoding="utf-8") == (
-        "OPENAI_BASE_URL=https://llm.example/v1\nOPENAI_API_KEY=secret\nLLM_MODEL=test-model\n"
+        "ASF_LLM_PROVIDER=openai_compatible\nOPENAI_BASE_URL=https://llm.example/v1\nOPENAI_API_KEY=secret\nLLM_MODEL=test-model\n"
     )
     assert app.configuration()["llm_configured"] is True
 
@@ -45,6 +49,37 @@ def test_provider_config_preserves_existing_env_entries(client, isolated_project
     assert "TAVILY_API_KEY=search-secret" in saved
     assert "OTHER=value" in saved
     assert "OPENAI_BASE_URL=http://localhost:8000/v1" in saved
+
+
+def test_azure_provider_saves_separate_profile_and_does_not_replace_openai_key(client, isolated_project, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-profile-secret")
+    (isolated_project / ".env").write_text(
+        "OPENAI_API_KEY=openai-profile-secret\nOPENAI_BASE_URL=https://openai.example/v1\n",
+        encoding="utf-8",
+    )
+    response = client.put("/api/config/provider", json={
+        "provider_type": "azure_openai",
+        "base_url": "https://servicedeskgpt.openai.azure.com/",
+        "api_key": "azure-profile-secret",
+        "api_version": "2024-08-01-preview",
+        "model": "gpt-5.3-chat",
+    })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True, "llm_configured": True, "provider_type": "azure_openai",
+        "base_url": "https://servicedeskgpt.openai.azure.com/",
+        "model": "gpt-5.3-chat", "api_version": "2024-08-01-preview",
+    }
+    saved = (isolated_project / ".env").read_text(encoding="utf-8")
+    assert "ASF_LLM_PROVIDER=azure_openai" in saved
+    assert "AZURE_OPENAI_API_KEY=azure-profile-secret" in saved
+    assert "AZURE_OPENAI_ENDPOINT=https://servicedeskgpt.openai.azure.com/" in saved
+    assert "AZURE_OPENAI_API_VERSION=2024-08-01-preview" in saved
+    assert "AZURE_OPENAI_DEPLOYMENT_NAME=gpt-5.3-chat" in saved
+    assert "OPENAI_API_KEY=openai-profile-secret" in saved
+    assert app.configuration()["provider_type"] == "azure_openai"
+    assert "AZURE_OPENAI_API_KEY" not in app.configuration()
 
 
 def test_chat_rejects_blank_message(client):

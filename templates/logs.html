@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0a0d12">
+  <link rel="icon" type="image/svg+xml" href="/static/asf-mark.svg?v=1">
+  <title>ASF · Logs</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0a0d12;--panel:#111720;--panel2:#151e29;--border:#263241;--text:#e6edf5;--muted:#93a2b5;--teal:#64d9bd;--red:#ff8585;--amber:#ffcc72}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+    a{color:var(--teal)}.shell{max-width:1440px;margin:auto;padding:28px}
+    header{display:flex;justify-content:space-between;align-items:center;gap:20px;border-bottom:1px solid var(--border);padding-bottom:20px}
+    h1{font-size:28px;margin:2px 0}.eyebrow{color:var(--teal);font-size:11px;font-weight:700;letter-spacing:.12em}
+    .actions,.filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+    button,a.button,select,input{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:9px 12px}
+    button,a.button{cursor:pointer;text-decoration:none}button:hover,a.button:hover{border-color:var(--teal)}
+    .warning{margin:20px 0;padding:13px 16px;border:1px solid #80682f;background:#241f13;border-radius:10px;color:#f5d898}
+    .controls{display:flex;justify-content:space-between;align-items:end;gap:18px;flex-wrap:wrap;margin:20px 0}
+    label{display:grid;gap:5px;color:var(--muted);font-size:12px}.filters input{min-width:260px}
+    .meta{color:var(--muted);font-size:12px;margin-top:8px}
+    .cards{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px;margin:18px 0}
+    .card{border:1px solid var(--border);border-radius:10px;padding:14px;background:var(--panel)}.card small{display:block;color:var(--muted)}.card strong{font-size:21px}
+    .table-wrap{overflow:auto;border:1px solid var(--border);border-radius:10px;background:var(--panel)}
+    .tool-summary{margin:22px 0}.tool-summary h2{font-size:16px}.tool-summary table{min-width:0}
+    table{width:100%;border-collapse:collapse;min-width:900px}th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--border)}
+    th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.07em}
+    td.time,td.level,td.logger,td.request{white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+    td.message{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}
+    tr:last-child td{border-bottom:0}.level-ERROR,.level-CRITICAL{color:var(--red);font-weight:700}.level-WARNING{color:var(--amber);font-weight:700}.level-INFO{color:var(--teal)}
+    .empty{padding:36px;text-align:center;color:var(--muted)}.status{min-height:24px;color:var(--muted);margin:10px 0}
+    @media(max-width:760px){.shell{padding:18px}.cards{grid-template-columns:repeat(2,minmax(110px,1fr))}header{align-items:flex-start;flex-direction:column}.filters input{min-width:180px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div><div class="eyebrow">AGENT SKILL FOUNDRY / DIAGNOSTICS</div><h1>Application logs</h1><div class="meta">Request, agent, tool, sandbox, and skill lifecycle events</div></div>
+      <div class="actions">
+        <a class="button" href="/">Back to chat</a>
+        <button id="refresh" type="button">Refresh</button>
+        <button id="download" type="button" disabled>Download HTML snapshot</button>
+      </div>
+    </header>
+    <aside class="warning"><strong>Log data notice:</strong> This dashboard is generated from local ASF log files. Entries are diagnostic records, may be incomplete or rotated, and are not authoritative audit evidence.</aside>
+    <section class="controls" aria-label="Log file and filters">
+      <div>
+        <label for="file-select">Log file</label>
+        <select id="file-select"><option>Loading…</option></select>
+        <div class="meta" id="file-meta"></div>
+      </div>
+      <div class="filters">
+        <label for="search">Search entries<input id="search" type="search" placeholder="Event, request ID, logger…"></label>
+        <label for="level">Level<select id="level"><option value="">All levels</option><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>CRITICAL</option><option>UNKNOWN</option></select></label>
+        <label for="limit">Rows to load<select id="limit"><option value="500">500</option><option value="1000" selected>1,000</option><option value="5000">5,000</option><option value="10000">10,000</option></select></label>
+      </div>
+    </section>
+    <section class="cards" aria-label="Selected file summary">
+      <div class="card"><small>Entries loaded</small><strong id="count-total">—</strong></div>
+      <div class="card"><small>Application errors</small><strong id="count-errors">—</strong></div>
+      <div class="card"><small>Warnings</small><strong id="count-warnings">—</strong></div>
+      <div class="card"><small>Displayed rows</small><strong id="count-visible">—</strong></div>
+      <div class="card"><small>HTTP requests</small><strong id="count-http-requests">—</strong></div>
+      <div class="card"><small>Failed requests</small><strong id="count-http-failures">—</strong></div>
+      <div class="card"><small>Avg. request time (ms)</small><strong id="count-http-duration">—</strong></div>
+      <div class="card"><small>Agent runs</small><strong id="count-agent-runs">—</strong></div>
+      <div class="card"><small>Completed runs</small><strong id="count-agent-completed">—</strong></div>
+      <div class="card"><small>Failed runs</small><strong id="count-agent-failed">—</strong></div>
+      <div class="card"><small>Incomplete runs</small><strong id="count-agent-incomplete">—</strong></div>
+      <div class="card"><small>Model calls</small><strong id="count-model-calls">—</strong></div>
+      <div class="card"><small>Model failures</small><strong id="count-model-failures">—</strong></div>
+      <div class="card"><small>Prompt tokens</small><strong id="count-prompt-tokens">—</strong></div>
+      <div class="card"><small>Completion tokens</small><strong id="count-completion-tokens">—</strong></div>
+      <div class="card"><small>Total tokens</small><strong id="count-total-tokens">—</strong></div>
+      <div class="card"><small>Calls without usage</small><strong id="count-usage-missing">—</strong></div>
+      <div class="card"><small>Tool runs</small><strong id="count-tool-runs">—</strong></div>
+      <div class="card"><small>Tool failures</small><strong id="count-tool-failures">—</strong></div>
+    </section>
+    <div class="meta">AI metrics are aggregated across the full selected log file. Token totals are provider-reported; unavailable usage is counted separately. Partial or rotated logs can produce incomplete run counts.</div>
+    <section class="tool-summary" aria-label="Tool run totals by tool">
+      <h2>Tool runs by tool</h2>
+      <div class="table-wrap"><table><thead><tr><th>Tool</th><th>Runs</th><th>Failures</th></tr></thead><tbody id="tool-summary-rows"><tr><td class="empty" colspan="3">Loading tool totals…</td></tr></tbody></table></div>
+    </section>
+    <div id="status" class="status" role="status"></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time (UTC)</th><th>Level</th><th>Logger</th><th>Request ID</th><th>Event / details</th></tr></thead>
+        <tbody id="entries"><tr><td class="empty" colspan="5">Loading logs…</td></tr></tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    const $ = selector => document.querySelector(selector);
+    const state = {files:[],selected:null,data:null};
+    const formatBytes = bytes => bytes < 1024*1024 ? (bytes/1024).toFixed(1) + ' KB' : (bytes/1024/1024).toFixed(2) + ' MB';
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    async function loadFiles() {
+      const response = await fetch('/api/logs');
+      if (!response.ok) throw new Error('Could not list log files (' + response.status + ')');
+      const data = await response.json();
+      state.files = data.files;
+      const select = $('#file-select');
+      select.replaceChildren();
+      for (const file of state.files) {
+        const option = document.createElement('option');
+        option.value = file.name;
+        option.textContent = file.name + ' · ' + formatBytes(file.size_bytes);
+        select.append(option);
+      }
+      if (!state.files.length) {
+        state.selected = null;
+        state.data = null;
+        select.add(new Option('No log files found', ''));
+        renderToolSummary({});
+        $('#entries').innerHTML = '<tr><td class="empty" colspan="5">No log files are available. Check ASF_LOG_FILE and generate an application log event.</td></tr>';
+        $('#file-meta').textContent = '';
+        $('#download').disabled = true;
+        updateSummary([]);
+        return;
+      }
+      const preferred = state.selected && state.files.some(file => file.name === state.selected)
+        ? state.selected : data.selected;
+      state.selected = preferred;
+      select.value = preferred;
+      await loadSelectedFile();
+    }
+
+    function computeAiMetrics(entries) {
+      const metrics = state.data?.ai_metrics || {};
+      return {
+        httpRequests: metrics.http_requests || 0,
+        httpFailures: metrics.http_failures || 0,
+        httpAvgDuration: metrics.http_avg_duration_ms || 0,
+        agentRuns: metrics.agent_runs || 0,
+        agentCompleted: metrics.agent_completed || 0,
+        agentFailed: metrics.agent_failed || 0,
+        agentIncomplete: metrics.agent_incomplete || 0,
+        modelCalls: metrics.model_calls || 0,
+        modelFailures: metrics.model_failures || 0,
+        promptTokens: metrics.prompt_tokens || 0,
+        completionTokens: metrics.completion_tokens || 0,
+        totalTokens: metrics.total_tokens || 0,
+        usageMissing: metrics.usage_missing || 0,
+        toolRuns: metrics.tool_runs || 0,
+        toolFailures: metrics.tool_failures || 0,
+        toolCounts: metrics.tool_counts || {}
+      };
+    }
+
+    function renderToolSummary(toolCounts) {
+      const tbody = $('#tool-summary-rows');
+      tbody.replaceChildren();
+      const tools = Object.entries(toolCounts || {}).sort((left, right) => right[1].runs - left[1].runs || left[0].localeCompare(right[0]));
+      if (!tools.length) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.className = 'empty'; cell.colSpan = 3; cell.textContent = 'No per-tool run events are available in this log file.';
+        row.append(cell); tbody.append(row); return;
+      }
+      for (const [name, counts] of tools) {
+        const row = document.createElement('tr');
+        for (const value of [name, counts.runs.toLocaleString(), counts.failures.toLocaleString()]) {
+          const cell = document.createElement('td'); cell.textContent = value; row.append(cell);
+        }
+        tbody.append(row);
+      }
+    }
+
+    function updateSummary(visibleEntries = []) {
+      const allEntries = state.data?.entries || [];
+      $('#count-total').textContent = state.data?.total_entries ?? 0;
+      $('#count-errors').textContent = allEntries.filter(entry => ['ERROR','CRITICAL'].includes(entry.level)).length;
+      $('#count-warnings').textContent = allEntries.filter(entry => entry.level === 'WARNING').length;
+      $('#count-visible').textContent = visibleEntries.length;
+      const metrics = computeAiMetrics(allEntries);
+      renderToolSummary(metrics.toolCounts);
+      $('#count-http-requests').textContent = metrics.httpRequests.toLocaleString();
+      $('#count-http-failures').textContent = metrics.httpFailures.toLocaleString();
+      $('#count-http-duration').textContent = metrics.httpAvgDuration.toLocaleString();
+      $('#count-agent-runs').textContent = metrics.agentRuns.toLocaleString();
+      $('#count-agent-completed').textContent = metrics.agentCompleted.toLocaleString();
+      $('#count-agent-failed').textContent = metrics.agentFailed.toLocaleString();
+      $('#count-agent-incomplete').textContent = metrics.agentIncomplete.toLocaleString();
+      $('#count-model-calls').textContent = metrics.modelCalls.toLocaleString();
+      $('#count-model-failures').textContent = metrics.modelFailures.toLocaleString();
+      $('#count-prompt-tokens').textContent = metrics.promptTokens.toLocaleString();
+      $('#count-completion-tokens').textContent = metrics.completionTokens.toLocaleString();
+      $('#count-total-tokens').textContent = metrics.totalTokens.toLocaleString();
+      $('#count-usage-missing').textContent = metrics.usageMissing.toLocaleString();
+      $('#count-tool-runs').textContent = metrics.toolRuns.toLocaleString();
+      $('#count-tool-failures').textContent = metrics.toolFailures.toLocaleString();
+    }
+
+    function renderRows() {
+      if (!state.data) return;
+      const query = $('#search').value.trim().toLowerCase();
+      const level = $('#level').value;
+      const filtered = state.data.entries.filter(entry => {
+        const matchesLevel = !level || entry.level === level;
+        const haystack = [entry.timestamp,entry.level,entry.logger,entry.request_id,entry.message].join(' ').toLowerCase();
+        return matchesLevel && (!query || haystack.includes(query));
+      });
+      const tbody = $('#entries');
+      tbody.replaceChildren();
+      for (const entry of filtered) {
+        const row = document.createElement('tr');
+        for (const [value, className] of [
+          [entry.timestamp,'time'], [entry.level,'level level-' + entry.level],
+          [entry.logger,'logger'], [entry.request_id,'request'], [entry.message,'message']
+        ]) {
+          const cell = document.createElement('td');
+          cell.className = className;
+          cell.textContent = value || '—';
+          row.append(cell);
+        }
+        tbody.append(row);
+      }
+      if (!filtered.length) tbody.innerHTML = '<tr><td class="empty" colspan="5">No entries match these filters.</td></tr>';
+      updateSummary(filtered);
+      $('#status').textContent = state.data.truncated
+        ? 'Showing the newest ' + state.data.returned_entries.toLocaleString() + ' of ' + state.data.total_entries.toLocaleString() + ' lines in this file.'
+        : state.data.total_entries.toLocaleString() + ' lines loaded from ' + state.data.file + '.';
+    }
+
+    async function loadSelectedFile() {
+      if (!state.selected) return;
+      const response = await fetch('/api/logs/' + encodeURIComponent(state.selected) + '?limit=' + $('#limit').value);
+      if (!response.ok) throw new Error('Could not read selected log (' + response.status + ')');
+      state.data = await response.json();
+      const file = state.files.find(item => item.name === state.selected);
+      $('#file-meta').textContent = file ? formatBytes(file.size_bytes) + ' · modified ' + new Date(file.modified_at).toLocaleString() : formatBytes(state.data.size_bytes);
+      $('#download').disabled = false;
+      renderRows();
+    }
+
+    function downloadSnapshot() {
+      if (!state.data) return;
+      const rows = state.data.entries.map(entry => '<tr><td>' + escapeHtml(entry.timestamp) + '</td><td>' + escapeHtml(entry.level) + '</td><td>' + escapeHtml(entry.logger) + '</td><td>' + escapeHtml(entry.request_id) + '</td><td><pre>' + escapeHtml(entry.message) + '</pre></td></tr>').join('');
+      const metrics = computeAiMetrics(state.data.entries);
+      const toolRows = Object.entries(metrics.toolCounts).sort((left, right) => right[1].runs - left[1].runs || left[0].localeCompare(right[0])).map(([name, counts]) => '<tr><td>' + escapeHtml(name) + '</td><td>' + counts.runs + '</td><td>' + counts.failures + '</td></tr>').join('');
+      const toolTable = '<section><h2>Tool runs by tool</h2><table><thead><tr><th>Tool</th><th>Runs</th><th>Failures</th></tr></thead><tbody>' + (toolRows || '<tr><td colspan="3">No per-tool run events are available in this log file.</td></tr>') + '</tbody></table></section>';
+      const metricsHtml = '<section><h2>Observability summary for selected log file</h2><p>HTTP requests: ' + metrics.httpRequests + ' · Failed requests: ' + metrics.httpFailures + ' · Average request time (ms): ' + metrics.httpAvgDuration + '</p><p>Agent runs: ' + metrics.agentRuns + ' · Completed: ' + metrics.agentCompleted + ' · Failed: ' + metrics.agentFailed + ' · Incomplete: ' + metrics.agentIncomplete + ' · Model calls: ' + metrics.modelCalls + ' · Model failures: ' + metrics.modelFailures + ' · Prompt tokens: ' + metrics.promptTokens + ' · Completion tokens: ' + metrics.completionTokens + ' · Total tokens: ' + metrics.totalTokens + ' · Calls without usage: ' + metrics.usageMissing + ' · Tool runs: ' + metrics.toolRuns + ' · Tool failures: ' + metrics.toolFailures + '</p></section>' + toolTable;
+      const html = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>ASF log snapshot</title><style>body{font:14px system-ui;background:#10151d;color:#e6edf5;padding:24px}aside{padding:14px;background:#332915;color:#ffe3a1;border-radius:8px}table{border-collapse:collapse;width:100%;margin-top:20px}th,td{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid #394454}pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:0}code{font-family:monospace}</style><h1>ASF log snapshot</h1><p>File: ' + escapeHtml(state.data.file) + ' · generated ' + escapeHtml(new Date().toISOString()) + '</p><aside><strong>Log data notice:</strong> Generated from ASF local logs. Entries may be incomplete or rotated and are not authoritative audit evidence.</aside>' + metricsHtml + '<table><thead><tr><th>Time (UTC)</th><th>Level</th><th>Logger</th><th>Request ID</th><th>Event / details</th></tr></thead><tbody>' + rows + '</tbody></table></html>';
+      const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = 'asf-log-' + state.data.file.replace(/[^a-zA-Z0-9._-]/g,'_') + '-' + Date.now() + '.html';
+      link.click();
+      URL.revokeObjectURL(link.href);
+    }
+
+    async function refresh() {
+      $('#status').textContent = 'Refreshing logs…';
+      try { await loadFiles(); }
+      catch (error) { $('#status').textContent = 'Could not load logs: ' + error.message; }
+    }
+    $('#refresh').addEventListener('click', refresh);
+    $('#download').addEventListener('click', downloadSnapshot);
+    $('#file-select').addEventListener('change', async event => { state.selected=event.target.value; try { await loadSelectedFile(); } catch(error) { $('#status').textContent=error.message; } });
+    $('#search').addEventListener('input', renderRows);
+    $('#level').addEventListener('change', renderRows);
+    $('#limit').addEventListener('change', async () => { try { await loadSelectedFile(); } catch(error) { $('#status').textContent=error.message; } });
+    refresh();
+  </script>
+</body>
+</html>

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -21,6 +22,7 @@ DB_PATH = ROOT / "data" / "skills.sqlite"
 APPROVED = ROOT / "skills" / "approved"
 DRAFTS: dict[str, dict] = {}
 MAX_OUTPUT = 20000
+logger = logging.getLogger("asf.skills")
 
 
 def now() -> str:
@@ -98,6 +100,7 @@ def get_skill(slug: str) -> dict | None:
 def audit(slug: str | None, action: str, detail: dict) -> None:
     with connect() as conn:
         conn.execute("INSERT INTO audit(slug,action,detail,created_at) VALUES(?,?,?,?)", (slug, action, json.dumps(detail), now()))
+    logger.info("skill_audit_recorded action=%s slug=%s", action, slug or "-")
 
 
 def propose_skill(task: str, candidate: dict | None = None) -> dict:
@@ -117,18 +120,23 @@ def propose_skill(task: str, candidate: dict | None = None) -> dict:
     skill.setdefault("inputs", {})
     draft_id = uuid.uuid4().hex
     DRAFTS[draft_id] = {"id": draft_id, "request": task, "skill": skill, "attempts": []}
+    logger.info("skill_draft_created draft_id=%s skill_type=%s request_chars=%s", draft_id, skill.get("skill_type"), len(task))
     return DRAFTS[draft_id]
 
 
 def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
     """Run user-reviewed Python in Docker only; never execute in this process."""
     if not code.strip():
+        logger.warning("skill_test_rejected slug=%s reason=empty_source", slug or "-")
         return {"success": False, "error": "No Python source provided.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": ""}
     docker = shutil.which("docker")
     if not docker:
-        return {"success": False, "status": "sandbox_unavailable", "error": "Docker is not installed. Install and start Docker Desktop to run Python skill tests; skill code is never executed directly on the host.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": hashlib.sha256(code.encode()).hexdigest()}
+        source_hash = hashlib.sha256(code.encode()).hexdigest()
+        logger.warning("skill_test_unavailable slug=%s reason=docker_not_installed source_sha256=%s", slug or "-", source_hash)
+        return {"success": False, "status": "sandbox_unavailable", "error": "Docker is not installed. Install and start Docker Desktop to run Python skill tests; skill code is never executed directly on the host.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": source_hash}
     source_hash = hashlib.sha256(code.encode()).hexdigest()
     start = time.monotonic()
+    logger.info("skill_test_started slug=%s source_chars=%s source_sha256=%s", slug or "-", len(code), source_hash)
     sandbox_root = ROOT / "data" / "sandbox"
     sandbox_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="asf-skill-", dir=sandbox_root) as folder:
@@ -186,6 +194,11 @@ print(json.dumps(envelope, default=str))"""
                      (slug, source_hash, int(result["success"]), result["stdout"], result["error"], result["duration_ms"], now()))
         if slug:
             conn.execute("UPDATE skills SET last_test=?,last_execution=? WHERE slug=?", (json.dumps(result), "passed" if result["success"] else "failed", slug))
+    log_method = logger.info if result["success"] else logger.warning
+    log_method(
+        "skill_test_finished slug=%s status=%s success=%s duration_ms=%s source_sha256=%s",
+        slug or "-", result.get("status", "failed"), result["success"], result["duration_ms"], source_hash,
+    )
     return result
 
 
@@ -194,6 +207,7 @@ def promote(draft: dict, actor: str = "user") -> dict:
     if skill.get("skill_type") in {"python", "hybrid"}:
         run = test_code(skill.get("code", ""), draft.get("accept_inputs", {"user_input": draft["request"]}))
         if not run["success"]:
+            logger.warning("skill_promotion_blocked slug=%s reason=python_test_failed", slugify(skill.get("name", "skill")))
             return {"status": "test_failed", "test": run}
     slug = slugify(skill["name"])
     content = json.dumps(skill)
@@ -211,6 +225,7 @@ def promote(draft: dict, actor: str = "user") -> dict:
         conn.execute("INSERT OR REPLACE INTO skills VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (slug, skill["name"], skill["description"], skill["skill_type"], "approved", version, content, metadata, created, now(), None, "pending"))
         conn.execute("INSERT INTO versions(slug,version,content,metadata,changed_at,actor,note) VALUES(?,?,?,?,?,?,?)", (slug, version, content, metadata, now(), actor, "Approved reviewed candidate"))
         conn.execute("INSERT INTO audit(slug,action,detail,created_at) VALUES(?,?,?,?)", (slug, "approved", json.dumps({"version": version, "source_hash": hashlib.sha256(skill.get("code", "").encode()).hexdigest()}), now()))
+    logger.info("skill_approved slug=%s version=%s skill_type=%s", slug, version, skill.get("skill_type"))
     return {"status": "approved", "skill": get_skill(slug)}
 
 
@@ -223,6 +238,7 @@ def update_skill(slug: str, content: dict, actor: str = "user") -> dict:
     if skill.get("skill_type") in {"python", "hybrid"}:
         run = test_code(skill.get("code", ""), draft["accept_inputs"])
         if not run["success"]:
+            logger.warning("skill_update_blocked slug=%s reason=python_test_failed", slug)
             return {"status": "test_failed", "test": run}
     return promote(draft, actor)
 
@@ -231,8 +247,10 @@ def deprecate(slug: str) -> dict | None:
     with connect() as conn:
         cur = conn.execute("UPDATE skills SET status='deprecated',updated_at=? WHERE slug=?", (now(), slug))
         if not cur.rowcount:
+            logger.warning("skill_deprecation_not_found slug=%s", slug)
             return None
         conn.execute("INSERT INTO audit(slug,action,detail,created_at) VALUES(?,?,?,?)", (slug, "deprecated", "{}", now()))
+    logger.info("skill_deprecated slug=%s", slug)
     return get_skill(slug)
 
 
