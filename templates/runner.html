@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0a0d12"><title>Skill Runner · Agent Skill Foundry</title>
+  <link rel="icon" type="image/svg+xml" href="/static/asf-mark.svg?v=1">
+  <link rel="stylesheet" href="/static/styles.css?v=6">
+  <style>.brand-mark{display:block;width:36px;height:36px;border:0;background:none;border-radius:10px;object-fit:cover}.welcome-glyph{padding:0;overflow:hidden}.welcome-glyph img{width:100%;height:100%;display:block;object-fit:cover}.model-picker select{max-width:220px;color:var(--text);background:#11171e;border:1px solid #293541;border-radius:5px;padding:8px 9px;font-size:11px}.runner-content{white-space:normal}.runner-content p{margin:.5em 0}.runner-content pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1015;padding:12px;border-radius:5px}.runner-content code{font-family:var(--mono)}.runner-steps{margin-top:10px}.runner-steps summary{cursor:pointer;color:var(--muted);font:10px var(--mono)}.runner-steps ol{padding-left:22px}.runner-steps li{margin:7px 0;color:#aab7bd}.runner-steps strong{color:#b5d9ca}.runner-steps pre{max-height:180px;overflow:auto;white-space:pre-wrap;background:#0a0e12;padding:8px;border-radius:4px;color:#94a3a8}@media(max-width:680px){.model-picker select{max-width:145px;padding:7px;font-size:10px}}</style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <a class="brand" href="/runner" aria-label="Skill Runner home"><img class="brand-mark" src="/static/asf-mark.svg" alt=""><span>ASF<span class="brand-caption">LOCAL WORKSPACE</span></span></a>
+      <div class="rail-label">WORKSPACE</div>
+      <nav class="nav" aria-label="Main navigation">
+        <a class="nav-item active" href="/runner"><span class="nav-icon">◉</span> Skill Runner</a>
+        <a class="nav-item" href="/foundry"><span class="nav-icon">✳</span> Skill Foundry</a>
+      </nav>
+      <div class="rail-bottom"><div class="system-card"><span class="pulse"></span><div><strong>Local system</strong><small id="system-state">Checking configuration…</small></div></div><div class="rail-footer">APPROVED SKILLS / TASK RUNNER<br>VERSION 0.1 · LOCAL ONLY</div></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div><span class="eyebrow">TASK EXECUTION / RUNNER</span><h1>Skill Runner</h1></div><div class="top-actions"><label class="model-picker"><span class="sr-only">Chat model</span><select id="chat-model-picker" aria-label="Choose chat model" disabled><option>Loading models…</option></select></label><span id="model-switch-status" class="model-status" role="status" aria-live="polite"></span><span class="local-badge"><span></span>LOCAL</span><a class="button button-quiet" href="/logs">Logs</a><button id="clear-chat" class="button button-quiet"><span>↺</span> Clear conversation</button></div></header>
+      <section id="config-banner" class="config-banner hidden" role="status"><span class="config-icon">!</span><div><strong>Set up a model provider</strong><p>Configure an OpenAI-compatible endpoint and key in Skill Foundry settings.</p></div><a class="button" href="/foundry">Open Foundry</a></section>
+      <section class="view chat-view">
+        <div id="messages" class="messages" aria-live="polite"><div class="welcome"><div class="welcome-glyph"><img src="/static/asf-mark.svg" alt="Agent Skill Foundry"></div><span class="eyebrow">TASK EXECUTION WORKSPACE</span><h2>What should I help you do?</h2><p>Use available tools and approved skills. The Runner checks the skill library only when a skill looks relevant.</p><div class="suggestions"><button data-prompt="Calculate 432134234234 + 2352435235"><span>∑</span> Calculate exactly</button><button data-prompt="Is this JSON valid? { &quot;name&quot;: &quot;Ada&quot;, &quot;active&quot;: true }"><span>✓</span> Validate JSON</button><button data-prompt="Search the web for the latest Python 3.14 release notes and cite sources."><span>↗</span> Search the web</button></div></div></div>
+        <form id="chat-form" class="composer"><div class="composer-meta"><span><span class="composer-dot"></span> Skill Runner agent</span><span>ENTER TO SEND <b>·</b> SHIFT + ENTER FOR NEW LINE</span></div><div class="composer-box"><label class="sr-only" for="chat-input">Describe the task</label><textarea id="chat-input" rows="2" placeholder="Describe a task to run…" required></textarea><button class="send-button" aria-label="Send message">↑</button></div><div class="composer-bottom"><span>Tool and skill results are shown in expandable steps</span><span><kbd>↵</kbd> send</span></div></form>
+      </section>
+      <footer class="app-footer"><span>AGENT SKILL FOUNDRY <span class="footer-sep">/</span> SKILL RUNNER</span><span>SKILLS ARE SHARED <span class="footer-sep">·</span> CHAT IS VOLATILE</span></footer>
+    </main>
+  </div>
+  <script src="/static/runner.js?v=1" defer></script>
+</body>
+</html>

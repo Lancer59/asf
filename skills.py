@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ast
 import json
 import logging
 import os
@@ -67,7 +68,28 @@ def skill_doc(skill: dict) -> str:
     # Agent Skills frontmatter names are identifiers, while ASF keeps the
     # original human-friendly name in its library and UI.
     front = {"name": slugify(skill["name"]), "description": skill["description"]}
-    return "---\n" + yaml.safe_dump(front, sort_keys=False).strip() + "\n---\n\n" + (skill.get("instructions") or "") + "\n"
+    body = [
+        "## Purpose",
+        skill.get("description", "Reusable capability."),
+        "",
+        "## Agent instructions",
+        skill.get("instructions") or "Follow the input and output contract below.",
+        "",
+        "## Input contract",
+        "```json",
+        json.dumps(skill.get("inputs", {}), ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## Output contract",
+        skill.get("expected_output") or "Return the result produced for the supplied input.",
+    ]
+    if skill.get("skill_type") in {"python", "hybrid"}:
+        body.extend([
+            "",
+            "## Executable contract",
+            "The Python implementation must expose `run(inputs: dict)` and return the result. Helper functions are allowed, but `run` must call them as needed. Do not use `main()` or printed text as the skill result.",
+        ])
+    return "---\n" + yaml.safe_dump(front, sort_keys=False).strip() + "\n---\n\n" + "\n".join(body) + "\n"
 
 
 def _record(row: sqlite3.Row) -> dict:
@@ -103,15 +125,44 @@ def audit(slug: str | None, action: str, detail: dict) -> None:
     logger.info("skill_audit_recorded action=%s slug=%s", action, slug or "-")
 
 
+def _skill_name_from_request(request: str) -> str:
+    text = re.sub(r"\s+", " ", request).strip().rstrip(".!? ")
+    match = re.search(r"\bskill\s+(?:for|to)\s+(.+)$", text, re.I)
+    if match:
+        text = match.group(1)
+    else:
+        text = re.sub(r"\s+(?:skill|capability)(?:\s+please)?$", "", text, flags=re.I)
+        text = re.sub(r"^(?:please\s+)?(?:i\s+)?(?:want|need|create|make|build|generate)\s+(?:me\s+)?", "", text, flags=re.I)
+        text = re.sub(r"^(?:a|an|the|reusable)\s+", "", text, flags=re.I)
+    text = re.sub(r"^(?:a|an|the|for|to)\s+", "", text, flags=re.I)
+    text = re.sub(r"\s+(?:that|which)\s+.*$", "", text, flags=re.I)
+    text = re.sub(r"\s+with\s+.*$", "", text, flags=re.I).strip()
+    words = text.split()
+    actions = {"check": "Checker", "checking": "Checker", "validate": "Validator", "validating": "Validator", "calculate": "Calculator", "calculating": "Calculator", "parse": "Parser", "parsing": "Parser", "convert": "Converter", "converting": "Converter", "summarize": "Summarizer", "summarizing": "Summarizer", "format": "Formatter", "formatting": "Formatter", "extract": "Extractor", "extracting": "Extractor"}
+    action = actions.get(words[0].lower()) if words else None
+    if action and len(words) > 1:
+        words = words[1:]
+        if words[-1].lower().endswith("ies"):
+            words[-1] = words[-1][:-3] + "y"
+        elif words[-1].lower().endswith("s") and not words[-1].lower().endswith("ss"):
+            words[-1] = words[-1][:-1]
+        words.append(action)
+    acronyms = {"json": "JSON", "api": "API", "csv": "CSV", "sql": "SQL", "html": "HTML", "xml": "XML", "url": "URL"}
+    return " ".join(acronyms.get(word.lower(), word.capitalize()) for word in words) or "Reusable Skill"
+
+
 def propose_skill(task: str, candidate: dict | None = None) -> dict:
+    default_name = _skill_name_from_request(task)
     skill = dict(candidate) if candidate else {
-        "name": "New reusable capability", "description": "A reusable capability proposed from the current task.",
+        "name": default_name, "description": f"A reusable capability for: {task}",
         "skill_type": "instruction", "instructions": f"\nDefine a repeatable process for: {task}\nKeep request-specific values as inputs.",
         "code": "", "inputs": {"user_input": {"type": "string", "default": ""}}, "expected_output": "A useful result for the supplied input.",
         "dependencies": [], "permissions": [], "tags": [], "category": "general",
         "tests": [{"name": "Original task", "inputs": {"user_input": task}, "expected": ""}], "tools": []
     }
-    skill.setdefault("name", "New reusable capability")
+    name = skill.get("name")
+    if not isinstance(name, str) or not name.strip() or name.strip().lower() in {"new reusable capability", "new skill", "skill"}:
+        skill["name"] = default_name
     skill.setdefault("description", f"A reusable capability for: {task}")
     skill.setdefault("skill_type", "instruction")
     skill.setdefault("code", "")
@@ -124,11 +175,25 @@ def propose_skill(task: str, candidate: dict | None = None) -> dict:
     return DRAFTS[draft_id]
 
 
+def python_entrypoint_error(code: str) -> str | None:
+    try:
+        parsed = ast.parse(code)
+    except SyntaxError as exc:
+        return f"Python source has a syntax error: {exc.msg}."
+    entry = next((node for node in parsed.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run"), None)
+    if entry is None or isinstance(entry, ast.AsyncFunctionDef) or not entry.args.args:
+        return "Python skills must define a synchronous run(inputs) function that returns the skill result; main() or print-only source is not a valid entry point."
+    return None
+
+
 def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
     """Run user-reviewed Python in Docker only; never execute in this process."""
     if not code.strip():
         logger.warning("skill_test_rejected slug=%s reason=empty_source", slug or "-")
         return {"success": False, "error": "No Python source provided.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": ""}
+    contract_error = python_entrypoint_error(code)
+    if contract_error:
+        return {"success": False, "status": "failed", "error": contract_error, "stdout": "", "stderr": "", "exit_code": 1, "duration_ms": 0, "source_hash": hashlib.sha256(code.encode()).hexdigest()}
     docker = shutil.which("docker")
     if not docker:
         source_hash = hashlib.sha256(code.encode()).hexdigest()
@@ -148,12 +213,18 @@ ns = runpy.run_path('/work/skill.py')
 inputs = json.load(open('/work/inputs.json'))
 captured_out, captured_err = io.StringIO(), io.StringIO()
 try:
+    run = ns.get('run')
+    if not callable(run):
+        raise TypeError('Python skill must define run(inputs).')
     with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
-        value = ns.get('run', lambda data: ns.get('result'))(inputs)
+        value = run(inputs)
+    if value is None:
+        raise ValueError('run(inputs) returned no result. Return a JSON-serializable value instead of relying on print output.')
+    json.dumps(value)
     envelope = {'result': value, 'user_stdout': captured_out.getvalue(), 'user_stderr': captured_err.getvalue()}
 except Exception as exc:
     envelope = {'result': None, 'user_stdout': captured_out.getvalue(), 'user_stderr': captured_err.getvalue(), 'exception': f'{type(exc).__name__}: {exc}'}
-print(json.dumps(envelope, default=str))"""
+print(json.dumps(envelope))"""
         command = [docker, "run", "--rm", "--network", "none", "--read-only", "--user", "65534:65534",
                    "--memory", "128m", "--cpus", "0.5", "--pids-limit", "32", "--cap-drop", "ALL",
                    "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
@@ -174,6 +245,8 @@ print(json.dumps(envelope, default=str))"""
                     user_stderr = envelope.get("user_stderr", "")
                     runtime_error = envelope.get("exception")
                     stdout = user_stdout
+                    if not runtime_error and returned is None:
+                        runtime_error = "ValueError: run(inputs) returned no result; return a JSON-serializable value."
                     if runtime_error:
                         code_exit = 1
                         stderr = runtime_error

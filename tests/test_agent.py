@@ -53,6 +53,28 @@ def test_json_skill_proposal_has_runnable_code_and_examples():
         assert skill["name"] == "JSON Validator"
         assert skill["inputs"]["json_text"]["type"] == "string"
         assert len(skill["tests"]) >= 2
+        assert "Input:" in skill["instructions"] and "Output:" in skill["instructions"]
+        assert "def run(inputs)" in skill["code"]
+    finally:
+        skills.DRAFTS.pop(draft["id"], None)
+
+
+def test_reusable_skill_proposal_uses_request_specific_name_and_model_candidate():
+    draft = agent._skill_proposal("Create a skill for checking logs")
+    assert draft["skill"]["name"] == "Log Checker"
+    skills.DRAFTS.pop(draft["id"], None)
+
+    candidate = {
+        "name": "New reusable capability", "description": "Check logs", "skill_type": "python",
+        "instructions": "Input: log_text. Output: findings object.",
+        "code": "def normalize(text): return text.strip()\ndef run(inputs): return {'normalized': normalize(inputs['log_text'])}",
+        "inputs": {"log_text": {"type": "string"}}, "expected_output": "Return normalized log text.",
+        "dependencies": [], "permissions": [], "tests": [], "tags": ["logs"], "category": "logs", "tools": [],
+    }
+    draft = agent._skill_proposal("Create a reusable skill to check logs", json.dumps(candidate))
+    try:
+        assert draft["skill"]["name"] == "Log Checker"
+        assert "def run(inputs)" in draft["skill"]["code"]
     finally:
         skills.DRAFTS.pop(draft["id"], None)
 
@@ -141,9 +163,9 @@ def test_create_agent_configures_compatible_model_and_registers_tools(monkeypatc
     options = captured["agent_options"]
     assert options["skills"] == ["/skills/approved/"]
     assert {tool.__name__ for tool in options["tools"]} == {
-        "list_approved_skills", "run_approved_skill", "propose_reusable_skill"
+        "list_approved_skills", "run_approved_skill"
     }
-    assert "call list_approved_skills first" in options["system_prompt"]
+    assert "do not list skills for every request" in options["system_prompt"]
     assert "Never claim code ran unless that tool returned success" in options["system_prompt"]
 
 
@@ -319,21 +341,65 @@ def test_agent_tool_closures_list_skills_propose_once_and_reject_unapproved_exec
     }])
     monkeypatch.setattr(agent, "approved_skill_directories", lambda: [])
     agent.DRAFTS.clear()
-    _, error = agent.create_agent()
+    _, error = agent.create_agent("foundry")
     assert error is None
     tools = {tool.__name__: tool for tool in captured["options"]["tools"]}
     assert json.loads(tools["list_approved_skills"]()) == [{
-        "slug": "demo", "name": "Demo", "description": "A demo", "skill_type": "python", "inputs": {"x": {"type": "integer"}}, "tags": ["sample"]
+        "slug": "demo", "name": "Demo", "description": "A demo", "skill_type": "python", "inputs": {"x": {"type": "integer"}}, "expected_output": "", "instructions": "", "tags": ["sample"]
     }]
-    first = tools["propose_reusable_skill"]("Create one demo skill")
-    second = tools["propose_reusable_skill"]("This should not create another")
+    proposed_code = "def run(inputs):\n    return {'answer': inputs['value']}"
+    proposal = {
+        "name": "Demo Skill", "description": "Return a value", "skill_type": "python",
+        "instructions": "Input: value. Output: answer object.", "code": proposed_code,
+        "inputs": {"value": {"type": "integer"}}, "expected_output": "An answer object.",
+        "dependencies": [], "permissions": [], "tests": [{"name": "basic", "inputs": {"value": 3}, "expected": {"answer": 3}}],
+        "tags": ["demo"], "category": "testing", "tools": [],
+    }
+    first = tools["propose_reusable_skill"]("Create one demo skill", json.dumps(proposal))
+    second = tools["propose_reusable_skill"]("This should not create another", json.dumps(proposal))
     assert "Draft created" in first
     assert "already created" in second
     assert len(agent.DRAFTS) == 1
-    not_approved = json.loads(tools["run_approved_skill"]("missing", {"x": 1}))
-    assert not_approved["success"] is False
-    assert not_approved["error"] == "Approved skill not found."
+    draft = next(iter(agent.DRAFTS.values()))
+    assert draft["skill"]["code"] == proposed_code
+    assert draft["skill"]["inputs"] == {"value": {"type": "integer"}}
+    assert "def run(inputs)" in captured["options"]["system_prompt"]
+    assert "run_approved_skill" not in tools
+    assert "Do not act as a general task assistant" in captured["options"]["system_prompt"]
     agent.DRAFTS.clear()
+
+
+def test_foundry_and_runner_toolsets_are_separate(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    captured = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **options): pass
+
+    deepagents = ModuleType("deepagents")
+    deepagents.create_deep_agent = lambda **options: captured.update(options=options) or "agent"
+    langchain_openai = ModuleType("langchain_openai")
+    langchain_openai.ChatOpenAI = FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "deepagents", deepagents)
+    monkeypatch.setitem(sys.modules, "langchain_openai", langchain_openai)
+    monkeypatch.setattr(agent, "approved_skill_directories", lambda: ["/approved"])
+    monkeypatch.setattr(agent, "approved_skill_files", lambda: {})
+
+    _, error = agent.create_agent("foundry")
+    assert error is None
+    foundry = captured["options"]
+    foundry_tools = {tool.__name__ for tool in foundry["tools"]}
+    assert foundry_tools == {"list_approved_skills", "propose_reusable_skill"}
+    assert foundry["skills"] == []
+
+    _, error = agent.create_agent("runner")
+    assert error is None
+    runner = captured["options"]
+    runner_tools = {tool.__name__ for tool in runner["tools"]}
+    assert runner_tools == {"list_approved_skills", "run_approved_skill"}
+    assert "propose_reusable_skill" not in runner_tools
+    assert runner["skills"] == ["/approved"]
 
 
 def test_invoke_agent_compacts_history_and_returns_model_tool_trace(monkeypatch):
@@ -354,7 +420,7 @@ def test_invoke_agent_compacts_history_and_returns_model_tool_trace(monkeypatch)
             recorded["payload"] = payload
             return {"messages": [tool_message, final_message]}
 
-    monkeypatch.setattr(agent, "create_agent", lambda: (FakeAgent(), None))
+    monkeypatch.setattr(agent, "create_agent", lambda workspace="runner": (FakeAgent(), None))
     monkeypatch.setattr(agent, "approved_skill_files", lambda: {"/skills/approved/demo/SKILL.md": "demo"})
     history = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "x" * 1700}]
 
@@ -412,9 +478,9 @@ def test_agent_stream_logs_model_usage_and_tool_durations(monkeypatch):
             for event in events:
                 yield event
 
-    monkeypatch.setattr(agent, "create_agent", lambda: (FakeAgent(), None))
+    monkeypatch.setattr(agent, "create_agent", lambda workspace="runner": (FakeAgent(), None))
     try:
-        run_immediate(agent.stream_agent("hello there", [], emit))
+        run_immediate(agent.stream_agent("hello there", [], emit, workspace="runner"))
     finally:
         agent.logger.removeHandler(handler)
 
@@ -422,6 +488,6 @@ def test_agent_stream_logs_model_usage_and_tool_durations(monkeypatch):
     assert any("agent_tool_finished tool=test_tool status=success" in line and "duration_ms=" in line for line in records)
     assert any("agent_tool_finished tool=broken_tool status=error" in line and "error_type=ValueError" in line for line in records)
     assert all("private detail" not in line for line in records)
-    assert any("agent_stream_finished status=success" in line and "model_calls=1" in line and "tool_runs=2" in line and "tool_failures=1" in line for line in records)
+    assert any("agent_stream_finished workspace=runner status=success" in line and "model_calls=1" in line and "tool_runs=2" in line and "tool_failures=1" in line for line in records)
 
 

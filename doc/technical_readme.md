@@ -4,20 +4,22 @@ This document describes the implementation in this repository. It is intended fo
 
 ## 1. System overview
 
-Agent Skill Foundry (ASF) is a single-process local web application for conversational use of approved reusable skills and for authoring, testing, reviewing, versioning, and deprecating those skills.
+Agent Skill Foundry (ASF) is a single-process local web application with two role-specific workspaces. Skill Foundry creates, tests, reviews, versions, and deprecates reusable skills. Skill Runner handles ordinary user tasks and uses relevant approved skills and task tools. Each workspace has its own page, API routes, agent instructions/tool set, and volatile conversation history. They share provider configuration, approved skill storage, SQLite lifecycle records, observability, and sandbox.
 
 The system has four main parts:
 
 1. A browser UI served by FastAPI, using static HTML, CSS, and JavaScript.
-2. An agent adapter that configures a LangChain `ChatOpenAI` client and a Deep Agents graph, then exposes approved skills, draft creation, and optional web search as tools.
+2. A role-aware agent adapter that configures LangChain `ChatOpenAI` and Deep Agents, exposing narrowly scoped lifecycle tools to Foundry and task/approved-skill tools to Runner.
 3. A skill lifecycle module backed by SQLite and approved-skill files on disk.
 4. A Docker-based runner for Python skill source. Draft code is not run in the web server process.
 
 ```mermaid
 flowchart TD
-    Browser[Browser UI<br/>HTML / CSS / JavaScript]
-    API[FastAPI app.py<br/>HTTP routes and SSE]
-    Agent[agent.py<br/>Deep Agents + ChatOpenAI]
+    FoundryUI[Skill Foundry UI<br/>/foundry]
+    RunnerUI[Skill Runner UI<br/>/runner]
+    API[FastAPI app.py<br/>role-specific HTTP routes and SSE]
+    FoundryAgent[Foundry agent<br/>draft and lifecycle tools]
+    RunnerAgent[Runner agent<br/>task tools and approved-skill execution]
     Skills[skills.py<br/>Lifecycle and sandbox]
     Model[OpenAI-compatible<br/>Chat Completions endpoint]
     Search[Tavily Search<br/>optional]
@@ -25,11 +27,14 @@ flowchart TD
     Files[(Approved skill folders<br/>SKILL.md and skill.py)]
     Docker[Docker Engine<br/>isolated Python execution]
 
-    Browser <-->|JSON / SSE| API
-    API --> Agent
-    Agent <-->|model calls and tool selection| Model
-    Agent -->|optional search tool| Search
-    Agent -->|approved skill lookup / run| Skills
+    FoundryUI <-->|JSON / SSE| API
+    RunnerUI <-->|JSON / SSE| API
+    API --> FoundryAgent
+    API --> RunnerAgent
+    FoundryAgent <-->|model calls and tool selection| Model
+    RunnerAgent <-->|model calls and tool selection| Model
+    FoundryAgent -->|skill proposal and optional research| Skills
+    RunnerAgent -->|approved skill lookup / run, optional search| Skills
     API -->|draft, review, library| Skills
     Skills <--> DB
     Skills <--> Files
@@ -40,7 +45,7 @@ flowchart TD
 ### Runtime topology
 
 - One Uvicorn process binds to `127.0.0.1` by default; `PORT` changes the port.
-- Conversation state and skill drafts are Python process globals. They are not session-scoped or shared between workers.
+- Foundry and Runner conversation state and skill drafts are separate Python process globals. Each workspace is isolated from the other, but state is not session-scoped and is not shared between workers.
 - SQLite and skill files are local persistent state under the repository by default.
 - The browser makes same-origin requests to the FastAPI server. There is no separate frontend build or API gateway.
 - Provider requests leave the machine and go to the configured endpoint. Tavily requests leave the machine when search is enabled. Skill source is mounted into the local Docker container.
@@ -52,13 +57,15 @@ This topology is designed for a single local user. It currently has no authentic
 | Path | Responsibility |
 |---|---|
 | `run.py` | Changes the working directory to the project root, checks core imports, loads `.env`, and starts Uvicorn. |
-| `app.py` | FastAPI app, provider configuration, chat SSE endpoint, skill and draft routes, process-local conversation state. |
-| `agent.py` | Model setup, Deep Agents tools, prompt policy, approved-skill execution adapter, model event translation. |
+| `app.py` | FastAPI app, provider configuration, workspace pages and role-specific chat SSE/clear routes, skill and draft routes, process-local conversation histories. |
+| `agent.py` | Shared model setup plus Foundry/Runner-specific prompts and tools, approved-skill execution adapter, model event translation. |
 | `skills.py` | SQLite setup and queries, draft creation, promotion/versioning, audit history, approved skill filesystem, Docker execution. |
-| `templates/index.html` | Single-page UI shell and dialogs. |
-| `static/app.js` | Browser API client, message rendering, SSE reader, activity display, skill library and review interactions. |
+| `templates/index.html` | Skill Foundry UI shell and dialogs. |
+| `templates/runner.html` | Independent Skill Runner UI shell. |
+| `static/app.js` | Foundry API client, message rendering, SSE reader, activity display, skill library and review interactions. |
+| `static/runner.js` | Runner API client, message rendering, SSE reader, and task activity display. |
 | `static/styles.css` | UI presentation and responsive styles. |
-| `skills/approved/<slug>/SKILL.md` | Agent Skills-compatible natural-language instructions for approved skills. |
+| `skills/approved/<slug>/SKILL.md` | Agent Skills-compatible instructions plus purpose, input, output, and executable contracts. |
 | `skills/approved/<slug>/skill.py` | Optional Python implementation stored for approved Python/hybrid skills. |
 | `data/skills.sqlite` | Persistent skill records, versions, audit entries, and execution records. |
 | `tests/` | Pytest coverage for agent helpers, route behavior, lifecycle, and sandbox outcomes. |
@@ -87,7 +94,7 @@ This topology is designed for a single local user. It currently has no authentic
 1. `run.py` sets the current directory and Python import path to the project root.
 2. It checks for core web dependencies and prints the install command if dependencies are missing.
 3. It loads `.env` and launches `app:app` with Uvicorn, loopback host, and the configured `PORT` or `8000`.
-4. Importing `app.py` loads `.env` again and initializes the FastAPI app, static mount, Jinja template loader, and empty in-memory `MESSAGES` list.
+4. Importing `app.py` loads `.env` again and initializes FastAPI, static assets, Jinja templates, and separate empty `FOUNDRY_MESSAGES` and `RUNNER_MESSAGES` lists.
 5. SQLite tables are created lazily when `skills.connect()` is called.
 
 ### Environment variables
@@ -135,12 +142,12 @@ Use `LOG_LEVEL=DEBUG` for more detailed metadata, or `ASF_LOG_FILE=` to disable 
 
 ### Chat request and streaming
 
-1. The browser sends `POST /api/chat/stream` with `{ "message": "..." }`.
-2. The route trims and validates the message, appends the user turn to `MESSAGES`, and bounds the list to its latest 20 message objects.
+1. Foundry sends `POST /api/foundry/chat/stream`; Runner sends `POST /api/runner/chat/stream`, each with `{ "message": "..." }`. Legacy `/api/chat/stream` aliases Runner.
+2. The route trims and validates the message, appends the user turn to the matching workspace history, and bounds that list to its latest 20 message objects.
 3. The route returns a `text/event-stream` response. A background asyncio task runs `agent.stream_agent` while the response generator forwards queued events as SSE `data:` frames. A comment keepalive frame is emitted during periods with no event.
-4. `stream_agent` creates a fresh agent for the request and supplies a small, trimmed recent history plus approved skill Markdown files.
+4. `stream_agent` creates the matching role-specific agent for the request and supplies a small, trimmed recent history. Only Runner receives approved skill Markdown files.
 5. Deep Agents emits lifecycle events. The adapter forwards model text chunks, translates tool start/end into user-facing labels, and tracks the events for the final result.
-6. When the graph finishes, the route may emit a draft payload or a skill suggestion, appends the assistant reply to `MESSAGES`, and emits a final `done` event.
+6. When the graph finishes, Foundry may emit a draft payload, appends the assistant reply to its own history, and emits a final `done` event. Runner emits its reply and activity to Runner's history only.
 7. The browser reads the response stream, renders tokens as they arrive, and retains activity events in an expandable panel attached to that assistant message.
 
 The client implements a small Markdown renderer for headings, paragraphs, lists, fenced code, tables, emphasis, inline code, and links. Text and HTML-sensitive content are escaped before insertion. This is a purpose-built subset, not a full CommonMark implementation.
@@ -171,12 +178,25 @@ An explicit skill creation request suppresses intermediate generated text and re
 1. Instantiates `ChatOpenAI` with model, API key, temperature zero, and a bounded `max_tokens` setting.
 2. Applies the configured compatible endpoint URL (or the legacy Groq fallback).
 3. Instantiates Tavily only when `TAVILY_API_KEY` is present.
-4. Registers tools for listing approved skills, running an approved executable skill, and proposing one draft. It adds web search only when configured.
-5. Supplies the approved skill directory to Deep Agents when approved skill files are available.
+4. Registers workspace-specific tools. Foundry can list approved skill metadata and prepare a draft; Runner can list and execute approved skills. Either role gets web search only when configured.
+5. Supplies approved skill directories and file contents to Runner only. Foundry does not receive skill execution tools or the approved-skill filesystem.
 
-The system prompt asks the model to check approved skills first, execute a matching Python/hybrid skill with the user's actual input, base claims of execution on tool results, avoid duplicate skill suggestions, use web search for current facts, and keep explicit skill creation replies concise. Tool results and skill instructions are treated as untrusted data.
+Foundry's system prompt focuses on reusable skill management, direct greetings, and a single proposal-tool call for explicit reusable-skill requests; it does not handle ordinary task execution. That tool requires the model to pass a complete candidate as JSON, including instructions, inputs, output contract, tests, and code when applicable. Python/hybrid source must define synchronous `run(inputs)`, may call helper functions, and must return JSON-serializable output; generic names and `main()`/print-only code are explicitly excluded. Runner's prompt handles tasks, asks it to greet without tools, search approved skills only for plausible matches, and ground claims of execution in returned tool results. Both prompts describe tool results and skill instructions as untrusted data. Tool registration enforces the main lifecycle boundaries independently of prompt wording.
 
-Conversation history is volatile and globally shared in process. `_compact_history` passes up to four recent messages to the agent and truncates individual content strings beyond 1,600 characters. The current request is separately limited to 6,000 characters before it is passed to the agent.
+Foundry and Runner each keep a volatile in-memory history, bounded to 20 message objects per workspace. `_compact_history` passes up to four recent messages to the agent and truncates individual content strings beyond 1,600 characters. The current request is separately limited to 6,000 characters before it is passed to the agent. `/api/foundry/chat/clear` and `/api/runner/chat/clear` clear only their own histories. The legacy `/api/chat/clear` alias clears Runner.
+
+### Workspace routes
+
+| Route | Behavior |
+|---|---|
+| `GET /` and `GET /foundry` | Render Skill Foundry (`templates/index.html`). |
+| `GET /runner` | Render Skill Runner (`templates/runner.html`). |
+| `POST /api/foundry/chat/stream` | Stream Foundry agent activity and response. |
+| `POST /api/runner/chat/stream` | Stream Runner agent activity and response. |
+| `POST /api/foundry/chat/clear` | Clear Foundry conversation only. |
+| `POST /api/runner/chat/clear` | Clear Runner conversation only. |
+
+Model picker/settings, library APIs, logs, SQLite and approved skill directories remain shared. Foundry's tool set is skill listing/proposal and optional web search for research; it does not get the approved-skill execution tool or skill directories. Runner gets approved-skill lookup/execution and optional web search; it does not get skill proposal/review/approval tools. Both prompts explicitly direct greetings to short direct responses without tools. There are no built-in task-specific calculator tools; arithmetic support can be supplied by a user-reviewed, approved calculator skill.
 
 ### Approved skill selection and execution
 
@@ -196,7 +216,9 @@ Drafts are stored in the in-memory `skills.DRAFTS` dictionary and have an ID, or
 - `instructions` and optional complete Python `code`.
 - `inputs`, `expected_output`, dependencies, permissions, tags, category, tests, and tools.
 
-The generic proposal has defaults and carries the original task as a sample input. The agent has an additional deterministic JSON validation proposal helper. Drafts disappear when the process restarts; test execution results for draft attempts are retained only in that draft object until then.
+Direct draft API calls have defaults and carry the original task as a sample input. The Foundry proposal tool accepts the full candidate authored by the agent; a focused JSON validation proposal helper remains available for JSON-specific requests. Missing or generic names are replaced with a human-readable name derived from the request. Drafts disappear when the process restarts; test execution results for draft attempts are retained only in that draft object until then.
+
+`skills.skill_doc()` writes the approved `SKILL.md` frontmatter and body. The body contains the purpose, candidate agent instructions, JSON input contract, and expected output. Python/hybrid skills also get the executable contract requiring `run(inputs: dict)` to return the result. Runner receives these documents as agent skills and gets input/output/instruction metadata from the skill-list tool; Python source remains private to the approved record until `run_approved_skill` executes it.
 
 ### Review and promotion gates
 
@@ -235,7 +257,7 @@ Promotion writes the approved Markdown/code files before persisting SQLite recor
 1. Rejects empty source. If Docker is not installed, reports `sandbox_unavailable` without executing code on the host.
 2. Creates a temporary directory under `data/sandbox`, writes `skill.py` and `inputs.json`, and passes a small runner program to the container.
 3. Invokes `docker run` with the `python:3.12-alpine` image, `--network none`, read-only root filesystem, non-root UID, memory/CPU/process limits, dropped Linux capabilities, no-new-privileges, a restricted `/tmp`, and a read-only bind mount of the temporary work directory.
-4. Runs Python isolated mode (`-I`). The runner imports the skill file with `runpy`, loads JSON input, invokes `run(inputs)` (or a `result` fallback), and captures user stdout and stderr separately from the runner envelope.
+4. Runs Python isolated mode (`-I`). The host checks syntax and requires a synchronous `run(inputs)` entry point. The container imports the skill file with `runpy`, loads JSON input, invokes `run(inputs)`, requires a non-`None` JSON-serializable return value, and captures user stdout and stderr separately from the runner envelope. `main()` and print-only code are rejected as skill entry points.
 5. Enforces a 15-second host-side subprocess timeout and clips captured output to `MAX_OUTPUT` (20,000 characters).
 6. Parses the runner JSON envelope, distinguishes the user's return value/prints from Docker/runner errors, hashes the source, and records the execution in SQLite when Docker invocation was attempted.
 
@@ -248,12 +270,17 @@ Payload models are declared in `app.py`. FastAPI/Pydantic performs JSON parsing 
 | Method and path | Purpose |
 |---|---|
 | `GET /` | Render the single-page app shell. |
+| `GET /foundry` | Render Skill Foundry; same page as `/`. |
+| `GET /runner` | Render the separate Skill Runner page. |
 | `GET /api/config` | Return provider/search configured flags, endpoint/model display values, and Docker availability. Does not reveal keys. |
 | `PUT /api/config/provider` | Validate and persist endpoint URL, API key, and model. |
 | `PUT /api/config/model-profile` | Update an existing custom `ASF_MODELS` entry and optionally its separately stored API key. |
 | `POST /api/config/model-profile` | Add a custom OpenAI-compatible or Azure profile to `ASF_MODELS`. |
-| `POST /api/chat/stream` | Accept `{message}` and return SSE. Empty trimmed messages return 422. |
-| `POST /api/chat/clear` | Clear process-local conversation messages. |
+| `POST /api/foundry/chat/stream` | Accept `{message}` and stream Foundry activity and response over SSE. |
+| `POST /api/runner/chat/stream` | Accept `{message}` and stream Runner activity and response over SSE. |
+| `POST /api/foundry/chat/clear` | Clear only Foundry's process-local conversation. |
+| `POST /api/runner/chat/clear` | Clear only Runner's process-local conversation. |
+| `POST /api/chat/stream`, `/api/chat/clear` | Backward-compatible aliases for Runner. |
 | `GET /api/skills?q=&status=` | List/filter skill records. |
 | `GET /api/skills/{slug}` | Return skill record, content, history, and audit entries. |
 | `PATCH /api/skills/{slug}` | Update content and create a new version after Python test passes when executable. |
@@ -271,15 +298,15 @@ There is no API authentication or CSRF/session model. By default the server bind
 
 ## 9. Frontend behavior
 
-`static/app.js` is a dependency-free browser client. It:
+`static/app.js` and `static/runner.js` are dependency-free clients for their respective workspaces. Both:
 
 - Sends JSON requests through a helper that converts non-2xx responses to UI errors.
 - Reads the SSE response body with `ReadableStream.getReader()` and a `TextDecoder`; it splits frames on blank lines and parses `data:` frames as JSON.
 - Appends streamed response text using the local Markdown formatter.
 - Displays model/tool activity in an expandable `<details>` panel on the relevant assistant response. Tool inputs and clipped outputs are rendered as escaped text.
-- Displays draft cards with editable fields, test input, test history, feedback/revision controls, reject, and accept actions.
-- Displays the persistent skill library with search/status filters, details, test, edit, and deprecate actions.
-- Clears the server-side volatile transcript and chat/draft UI when the user selects Clear conversation.
+- Keep the selected model profile in sync through the shared configuration API and clear only their own server-side volatile transcript.
+
+Foundry additionally displays draft cards with editable fields, test input, test history, feedback/revision controls, reject, and accept actions, and provides the persistent skill library with search/status filters, details, test, edit, and deprecate actions. Runner has no lifecycle editor; it focuses on task chat, tool activity, and approved skill use.
 
 The browser does not persist conversations in local storage, cookies, or SQLite. It retains current DOM state only until refresh/clear; drafts live server-side in memory until restart or disposition.
 
@@ -294,16 +321,16 @@ python -m pytest -q
 
 Current coverage is organized as follows:
 
-- `tests/test_agent.py`: history compaction, task/skill intent detection, duplicate-offer matching, JSON proposal source, approved skill execution delegation, progress labels, and OpenAI-compatible/Azure dated/v1 model setup.
+- `tests/test_agent.py`: history compaction, task/skill intent detection, derived skill names, complete JSON proposal transfer, callable JSON skill source, approved-skill execution delegation, progress labels, and OpenAI-compatible/Azure dated/v1 model setup.
 - `tests/test_app_routes.py`: OpenAI-compatible and Azure profile validation/persistence, separate credential preservation, home/config state, chat request validation/SSE response contract/history clearing, skill route errors, draft edit/test/review flows and acceptance gates.
 - `tests/test_skill_lifecycle.py`: proposal defaults, SQLite promotion, files/frontmatter, search, version history, failed/pass promotion, update, deprecation, audit details.
-- `tests/test_skill_execution.py`: successful runner parsing and captured prints, empty/no-Docker/daemon-unavailable states, runtime exceptions, timeout, malformed runner envelope, restrictive Docker arguments, approved Markdown exposure, slug/frontmatter naming.
+- `tests/test_skill_execution.py`: return values and captured prints, rejection of `main()`/print-only/`None`-returning code, empty/no-Docker/daemon-unavailable states, runtime exceptions, timeout, malformed runner envelope, restrictive Docker arguments, approved Markdown exposure, slug/frontmatter naming.
 - `tests/test_observability.py`: file logging format, request ID correlation, response header injection, lifecycle event coverage, and query-string exclusion.
 - `tests/test_log_dashboard.py`: newest-first log selection, generated-data warning and controls, reverse chronological parsing, full-file AI and per-tool metrics with truncated display rows, and rejection of unlisted paths.
 - `tests/conftest.py`: temporary project/database isolation and a direct endpoint-function adapter.
-- `tests/integration/test_live_chat.py`: opt-in real provider request through ASF's configured agent; asserts that the model calls `list_approved_skills`, receives a tool result, and returns a response.
+- `tests/integration/test_live_chat.py`: opt-in real provider checks for a Foundry greeting without tools and a Runner request that calls `list_approved_skills`, receives its result, and returns a response.
 
-The default suite mocks provider and Docker subprocess boundaries; it requires neither credentials nor a live Docker daemon and uses temporary SQLite storage for lifecycle and execution-record checks. Its route tests call endpoint functions directly to avoid a Windows socket-based test client. The opt-in live suite makes a real provider request through ASF's production agent and requires provider credentials and network access; it may incur usage charges. Enable it with `$env:ASF_LIVE_TESTS = "1"` in PowerShell or `set ASF_LIVE_TESTS=1` in `cmd.exe`, then run `python -m pytest -m live -q`. The live test checks model-to-tool calling but does not run the HTTP SSE route. Latest verification: **55 offline tests passed, 1 skipped** (`python -m pytest -q --basetemp .pytest-tmp` in the restricted workspace); `pip check` reported no broken requirements.
+The default suite mocks provider and Docker subprocess boundaries; it requires neither credentials nor a live Docker daemon and uses temporary SQLite storage for lifecycle and execution-record checks. Its route tests call endpoint functions directly to avoid a Windows socket-based test client. The opt-in live suite makes a real provider request through ASF's production agent and requires provider credentials and network access; it may incur usage charges. Enable it with `$env:ASF_LIVE_TESTS = "1"` in PowerShell or `set ASF_LIVE_TESTS=1` in `cmd.exe`, then run `python -m pytest -m live -q`. The live test checks model-to-tool calling but does not run the HTTP SSE route. Latest offline verification: **69 tests passed, 2 opt-in live tests skipped** (`python -m pytest -q --basetemp=.pytest-tmp`). Python compilation, JavaScript syntax checks, and `git diff --check` also passed.
 
 ## 11. Security, privacy, and operational boundaries
 

@@ -216,6 +216,26 @@ def test_chat_history_is_bounded_and_clear_removes_it(client):
     assert app.MESSAGES == []
 
 
+def test_foundry_and_runner_have_separate_pages_histories_and_clear_routes(client):
+    foundry = client.get("/foundry")
+    runner = client.get("/runner")
+    assert foundry.status_code == 200 and "Skill Foundry" in foundry.text
+    assert runner.status_code == 200 and "Skill Runner" in runner.text
+    assert "draft-host" in foundry.text
+    assert "draft-host" not in runner.text
+
+    assert client.post("/api/foundry/chat/stream", json={"message": "Create a skill"}).status_code == 200
+    assert client.post("/api/runner/chat/stream", json={"message": "Calculate 2 + 2"}).status_code == 200
+    assert [item["content"] for item in app.FOUNDRY_MESSAGES] == ["Create a skill"]
+    assert [item["content"] for item in app.RUNNER_MESSAGES] == ["Calculate 2 + 2"]
+
+    assert client.post("/api/foundry/chat/clear").json() == {"ok": True}
+    assert app.FOUNDRY_MESSAGES == []
+    assert [item["content"] for item in app.RUNNER_MESSAGES] == ["Calculate 2 + 2"]
+    assert client.post("/api/runner/chat/clear").json() == {"ok": True}
+    assert app.RUNNER_MESSAGES == []
+
+
 def test_skills_routes_filter_and_return_not_found(client, monkeypatch):
     monkeypatch.setattr(app.skills, "list_skills", lambda q="", status="": [{"slug": "json-validator", "status": "approved"}])
     monkeypatch.setattr(app.skills, "get_skill", lambda slug: None)
@@ -262,6 +282,41 @@ def test_draft_endpoints_edit_test_revise_reject_and_expiry(client, monkeypatch)
     rejected = client.post(f"/api/skills/drafts/{draft['id']}/review", json={"action": "reject", "skill": {}, "feedback": ""})
     assert rejected.json()["status"] == "rejected"
     assert client.get(f"/api/skills/drafts/{draft['id']}").status_code == 404
+
+
+def test_revision_schema_is_strict_compatible_and_restores_dynamic_inputs_and_tests(client, monkeypatch):
+    draft = skills.propose_skill("Create a reusable skill")
+    monkeypatch.setattr(app.llm_provider, "provider_configured", lambda: True)
+    revised_payload = {
+        "name": "code-skill", "description": "A code skill", "skill_type": "python",
+        "instructions": "Run code", "code": "def run(inputs): return inputs['value']",
+        "inputs_json": '{"value":{"type":"integer"}}', "expected_output": "The value",
+        "dependencies": [], "permissions": [], "tags": ["code"], "category": "utility",
+        "tests_json": '[{"name":"identity","inputs":{"value":3},"expected":3}]', "tools": [],
+    }
+    captured = {}
+
+    class FakeModel:
+        def with_structured_output(self, schema):
+            captured["schema"] = schema.model_json_schema()
+            captured["model"] = schema(**revised_payload)
+            return self
+
+        def invoke(self, _prompt):
+            return captured["model"]
+
+    monkeypatch.setattr(app.llm_provider, "create_chat_model", lambda **_kwargs: FakeModel())
+    response = client.post(f"/api/skills/drafts/{draft['id']}/revise", json={"action": "revise", "skill": {}, "feedback": "it should be a code skill"})
+
+    assert response.status_code == 200, response.text
+    schema = captured["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["inputs_json"]["type"] == "string"
+    assert schema["properties"]["tests_json"]["type"] == "string"
+    revised = response.json()["draft"]["skill"]
+    assert revised["skill_type"] == "python"
+    assert revised["inputs"] == {"value": {"type": "integer"}}
+    assert revised["tests"] == [{"name": "identity", "inputs": {"value": 3}, "expected": 3}]
 
 
 def test_draft_python_test_requires_successful_current_source_before_accept(client, monkeypatch):

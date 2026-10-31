@@ -26,6 +26,13 @@ def test_proposal_defaults_are_complete_and_requests_are_preserved(isolated_proj
     assert draft["attempts"] == []
 
 
+def test_proposal_name_is_derived_from_request_instead_of_generic_placeholder(isolated_project):
+    draft = skills.propose_skill("Create a reusable skill to validate JSON documents")
+    assert draft["skill"]["name"] == "JSON Document Validator"
+    draft = skills.propose_skill("I want a JSON validation skill please", {"name": "New reusable capability"})
+    assert draft["skill"]["name"] == "JSON Validation"
+
+
 def test_instruction_promotion_persists_searchable_record_version_and_spec_doc(isolated_project):
     draft = skills.propose_skill("Validate JSON")
     draft["skill"] = _candidate()
@@ -41,6 +48,9 @@ def test_instruction_promotion_persists_searchable_record_version_and_spec_doc(i
     doc = (skills.APPROVED / "json-validator" / "SKILL.md").read_text(encoding="utf-8")
     assert doc.startswith("---\nname: json-validator\ndescription:")
     assert "Parse the supplied document" in doc
+    assert "## Agent instructions" in doc
+    assert "## Input contract" in doc and '"json_text"' in doc
+    assert "## Output contract" in doc
     assert skills.list_skills(q="validation", status="approved")[0]["slug"] == "json-validator"
     assert skills.approved_skill_files()["/skills/approved/json-validator/SKILL.md"]["content"] == doc
 
@@ -80,6 +90,11 @@ def test_python_promotion_records_code_file_when_test_passes(isolated_project, m
 
     assert result["status"] == "approved"
     assert (skills.APPROVED / "python-checker" / "skill.py").read_text(encoding="utf-8") == draft["skill"]["code"]
+    doc = (skills.APPROVED / "python-checker" / "SKILL.md").read_text(encoding="utf-8")
+    assert "## Agent instructions" in doc
+    assert "## Input contract" in doc and '"json_text"' in doc
+    assert "## Output contract" in doc
+    assert "run(inputs: dict)" in doc
 
 
 def test_update_requires_passing_python_test_and_versions_changes(isolated_project, monkeypatch):

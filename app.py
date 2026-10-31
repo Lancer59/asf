@@ -37,7 +37,10 @@ app = FastAPI(title="Agent Skill Foundry", version="0.1.0")
 app.add_middleware(RequestLoggingMiddleware)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 templates = Jinja2Templates(directory=ROOT / "templates")
-MESSAGES: list[dict] = []
+FOUNDRY_MESSAGES: list[dict] = []
+RUNNER_MESSAGES: list[dict] = []
+# Backward-compatible alias for the old generic chat endpoint, now Skill Runner.
+MESSAGES = RUNNER_MESSAGES
 
 
 def _has_matching_approved_skill(text: str) -> bool:
@@ -101,6 +104,18 @@ class ModelProfileConfig(BaseModel):
 @app.get("/")
 def home(request: Request):
     return templates.TemplateResponse(request, "index.html", {"configured": llm_provider.provider_configured()})
+
+
+@app.get("/foundry")
+def foundry_home(request: Request):
+    return templates.TemplateResponse(request, "index.html", {"configured": llm_provider.provider_configured()})
+
+
+@app.get("/runner")
+def runner_home(request: Request):
+    return templates.TemplateResponse(request, "runner.html", {"configured": llm_provider.provider_configured()})
+
+
 
 
 @app.get("/logs")
@@ -458,22 +473,21 @@ def get_skill(slug: str):
     return result
 
 
-@app.post("/api/chat/stream")
-def chat_stream(payload: ChatInput):
+def _chat_stream(payload: ChatInput, workspace: str):
     text = payload.message.strip()
     if not text:
         raise HTTPException(422, "Message cannot be empty")
-    logger.info("chat_request_accepted message_chars=%s history_messages=%s", len(text), len(MESSAGES))
-    MESSAGES.append({"role": "user", "content": text})
-    # Keep exactly one volatile, bounded process-local conversation.
-    del MESSAGES[:-20]
+    messages = FOUNDRY_MESSAGES if workspace == "foundry" else RUNNER_MESSAGES
+    logger.info("chat_request_accepted workspace=%s message_chars=%s history_messages=%s", workspace, len(text), len(messages))
+    messages.append({"role": "user", "content": text})
+    del messages[:-20]
     async def stream():
         queue: asyncio.Queue = asyncio.Queue()
 
         async def emit(event):
             await queue.put(event)
 
-        task = asyncio.create_task(agent.stream_agent(text, MESSAGES[:-1], emit))
+        task = asyncio.create_task(agent.stream_agent(text, messages[:-1], emit, workspace=workspace))
         while not task.done() or not queue.empty():
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=0.15)
@@ -492,19 +506,50 @@ def chat_stream(payload: ChatInput):
                     created_draft = draft
         if created_draft:
             yield "data: " + json.dumps({"type": "draft", "draft": created_draft}, ensure_ascii=False, default=str) + "\n\n"
-        elif result.get("suggest_skill") and not _has_matching_approved_skill(" ".join(m.get("content", "") for m in MESSAGES[-6:])):
+        elif workspace == "foundry" and result.get("suggest_skill") and not _has_matching_approved_skill(" ".join(m.get("content", "") for m in messages[-6:])):
             yield "data: " + json.dumps({"type": "skill_offer", "request": text}, ensure_ascii=False) + "\n\n"
-        MESSAGES.append({"role": "assistant", "content": reply})
+        messages.append({"role": "assistant", "content": reply})
         yield "data: " + json.dumps({"type": "done", "reply": reply, "error": result.get("error")}, ensure_ascii=False) + "\n\n"
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.post("/api/foundry/chat/stream")
+def foundry_chat_stream(payload: ChatInput):
+    return _chat_stream(payload, "foundry")
+
+
+@app.post("/api/runner/chat/stream")
+def runner_chat_stream(payload: ChatInput):
+    return _chat_stream(payload, "runner")
+
+
+@app.post("/api/chat/stream")
+def chat_stream(payload: ChatInput):
+    """Compatibility alias for the former generic chat route (Skill Runner)."""
+    return _chat_stream(payload, "runner")
+
+
+def _clear_chat(workspace: str):
+    messages = FOUNDRY_MESSAGES if workspace == "foundry" else RUNNER_MESSAGES
+    previous_messages = len(messages)
+    messages.clear()
+    logger.info("chat_history_cleared workspace=%s messages_removed=%s", workspace, previous_messages)
+    return {"ok": True}
+
+
+@app.post("/api/foundry/chat/clear")
+def clear_foundry_chat():
+    return _clear_chat("foundry")
+
+
+@app.post("/api/runner/chat/clear")
+def clear_runner_chat():
+    return _clear_chat("runner")
+
+
 @app.post("/api/chat/clear")
 def clear_chat():
-    previous_messages = len(MESSAGES)
-    MESSAGES.clear()
-    logger.info("chat_history_cleared messages_removed=%s", previous_messages)
-    return {"ok": True}
+    return _clear_chat("runner")
 
 
 @app.post("/api/skills/drafts")
@@ -612,28 +657,45 @@ def revise_draft(draft_id: str, payload: ReviewInput):
     if not llm_provider.provider_configured():
         raise HTTPException(503, "Configure an OpenAI-compatible provider in Settings to request an agent revision")
     try:
-        from pydantic import BaseModel, Field
+        from pydantic import BaseModel, ConfigDict
 
         class SkillRevision(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+
             name: str
             description: str
             skill_type: str
             instructions: str
             code: str
-            inputs: dict
+            # Strict OpenAI-compatible JSON schemas cannot contain arbitrary
+            # object keys. Encode flexible skill metadata as JSON strings and
+            # decode it after structured output validation.
+            inputs_json: str
             expected_output: str
             dependencies: list[str]
             permissions: list[str]
             tags: list[str]
             category: str
-            tests: list[dict]
+            tests_json: str
             tools: list[str]
 
         model = llm_provider.create_chat_model(stream_usage=False).with_structured_output(SkillRevision)
         revised = model.invoke("Revise the reusable skill based on feedback. Keep request values in inputs. "
-            "Provide complete Python source only for python/hybrid types; keep all external permissions disabled unless explicitly asked. "
+            "Return inputs_json as a JSON-encoded object string and tests_json as a JSON-encoded array of test objects. "
+            "Use skill_type='python' when the user's feedback requests a code skill. Python/hybrid source must define synchronous run(inputs), call any helpers from it, and return a JSON-serializable value; never provide main()-only or print-only code. Keep external permissions disabled unless explicitly asked. "
             f"Original task: {draft['request']}\nCurrent draft: {json.dumps(draft['skill'])}\nFeedback: {payload.feedback}")
         revised_dict = revised.model_dump()
+        try:
+            revised_dict["inputs"] = json.loads(revised_dict.pop("inputs_json"))
+            revised_dict["tests"] = json.loads(revised_dict.pop("tests_json"))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("The structured revision returned invalid JSON for inputs or tests.") from exc
+        if not isinstance(revised_dict["inputs"], dict) or not isinstance(revised_dict["tests"], list) or any(not isinstance(test, dict) for test in revised_dict["tests"]):
+            raise ValueError("The structured revision must contain an inputs object and a list of test objects.")
+        if revised_dict["skill_type"] in {"python", "hybrid"}:
+            contract_error = skills.python_entrypoint_error(revised_dict["code"])
+            if contract_error:
+                raise ValueError(contract_error)
         before = draft["skill"]
         draft["skill"] = revised_dict
         draft["revision_diff"] = {key: {"before": before.get(key), "after": revised_dict.get(key)} for key in revised_dict if before.get(key) != revised_dict.get(key)}

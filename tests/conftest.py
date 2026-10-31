@@ -30,10 +30,12 @@ def isolated_project(tmp_path, monkeypatch):
     monkeypatch.setattr(skills, "APPROVED", tmp_path / "skills" / "approved")
     monkeypatch.setattr(app, "ROOT", tmp_path)
     skills.DRAFTS.clear()
-    app.MESSAGES.clear()
+    app.FOUNDRY_MESSAGES.clear()
+    app.RUNNER_MESSAGES.clear()
     yield tmp_path
     skills.DRAFTS.clear()
-    app.MESSAGES.clear()
+    app.FOUNDRY_MESSAGES.clear()
+    app.RUNNER_MESSAGES.clear()
 
 
 @pytest.fixture
@@ -66,6 +68,14 @@ def client(isolated_project):
                     from starlette.requests import Request
                     request = Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b"", "server": ("test", 80), "scheme": "http", "client": ("test", 1), "root_path": ""})
                     result = app.home(request).body.decode()
+                elif method == "GET" and path == "/foundry":
+                    from starlette.requests import Request
+                    request = Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b"", "server": ("test", 80), "scheme": "http", "client": ("test", 1), "root_path": ""})
+                    result = app.foundry_home(request).body.decode()
+                elif method == "GET" and path == "/runner":
+                    from starlette.requests import Request
+                    request = Request({"type": "http", "method": method, "path": path, "headers": [], "query_string": b"", "server": ("test", 80), "scheme": "http", "client": ("test", 1), "root_path": ""})
+                    result = app.runner_home(request).body.decode()
                 elif method == "GET" and path == "/api/config":
                     result = app.configuration()
                 elif method == "GET" and path == "/api/skills":
@@ -85,8 +95,16 @@ def client(isolated_project):
                     result = app.create_model_profile(app.ModelProfileConfig.model_validate(body))
                 elif method == "POST" and path == "/api/chat/stream":
                     result = app.chat_stream(app.ChatInput.model_validate(body))
+                elif method == "POST" and path == "/api/foundry/chat/stream":
+                    result = app.foundry_chat_stream(app.ChatInput.model_validate(body))
+                elif method == "POST" and path == "/api/runner/chat/stream":
+                    result = app.runner_chat_stream(app.ChatInput.model_validate(body))
                 elif method == "POST" and path == "/api/chat/clear":
                     result = app.clear_chat()
+                elif method == "POST" and path == "/api/foundry/chat/clear":
+                    result = app.clear_foundry_chat()
+                elif method == "POST" and path == "/api/runner/chat/clear":
+                    result = app.clear_runner_chat()
                 elif method == "POST" and path == "/api/skills/drafts":
                     result = app.create_draft(app.ChatInput.model_validate(body))
                 elif method == "POST" and "/test" in path and "/drafts/" in path:

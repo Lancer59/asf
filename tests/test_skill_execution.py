@@ -42,6 +42,15 @@ def test_test_code_rejects_empty_source_without_docker(monkeypatch):
     assert result["exit_code"] is None
 
 
+def test_test_code_rejects_main_or_print_only_source_without_docker(monkeypatch):
+    monkeypatch.setattr(skills.shutil, "which", lambda _: None)
+    result = skills.test_code("def main():\n    print('done')\n\nif __name__ == '__main__':\n    main()", {})
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert "run(inputs)" in result["error"]
+    assert "main() or print-only" in result["error"]
+
+
 def test_test_code_reports_missing_docker_and_hash(monkeypatch):
     code = "def run(inputs): return inputs"
     monkeypatch.setattr(skills.shutil, "which", lambda _: None)
@@ -77,6 +86,16 @@ def test_test_code_reports_runtime_exception_separately_from_container_failure(m
     assert result["stdout"] == "before crash\n"
     assert result["user_stderr"] == "warning\n"
     assert result["error"] == "ValueError: invalid input"
+
+
+def test_test_code_does_not_treat_none_return_as_success(monkeypatch, isolated_project):
+    output = {"result": None, "user_stdout": "printed but not returned\n", "user_stderr": ""}
+    monkeypatch.setattr(skills.shutil, "which", lambda _: "docker")
+    monkeypatch.setattr(skills.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(output), ""))
+    result = skills.test_code("def run(inputs):\n    print('printed but not returned')\n    return None", {})
+    assert result["success"] is False
+    assert "returned no result" in result["error"]
+    assert result["stdout"] == "printed but not returned\n"
 
 
 def test_test_code_reports_timeout_and_does_not_raise(monkeypatch, isolated_project):

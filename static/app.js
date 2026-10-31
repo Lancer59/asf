@@ -15,8 +15,8 @@ function selectView(view) {
   $('#chat-view').classList.toggle('hidden',view!=='chat');
   $('#skills-view').classList.toggle('hidden',view!=='skills');
   $$('.nav-item').forEach(item=>item.classList.toggle('active',item.dataset.view===view));
-  $('#page-title').textContent=view==='chat'?'Chat':'Skills';
-  $('#page-eyebrow').textContent=view==='chat'?'WORKSPACE / CONVERSATION':'CAPABILITY MANAGEMENT / LIBRARY';
+  $('#page-title').textContent=view==='chat'?'Skill Foundry':'Skills';
+  $('#page-eyebrow').textContent=view==='chat'?'SKILL MANAGEMENT / FOUNDRY':'CAPABILITY MANAGEMENT / LIBRARY';
   $('#model-picker-wrap').classList.toggle('hidden',view!=='chat');
   $('#model-switch-status').classList.toggle('hidden',view!=='chat');
   if(view==='skills') loadSkills();
@@ -86,7 +86,7 @@ async function sendMessage(text) {
   const events=[];let pending='';
   $('#chat-input').value='';
   try {
-    const response=await fetch('/api/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
+    const response=await fetch('/api/foundry/chat/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
     if(!response.ok) throw new Error((await response.json()).detail||`Request failed (${response.status})`);
     const reader=response.body.getReader(),decoder=new TextDecoder();
     const handleEvent=event=>{if(event.type==='token'){const placeholder=$('.stream-placeholder',bubble);if(placeholder)placeholder.remove();state.liveReply=(state.liveReply||'')+event.text;bubble.innerHTML=formatMessage(state.liveReply)}else if(event.type==='done'){if(!state.liveReply)bubble.innerHTML=formatMessage(event.reply||'No response.');if(event.error)bubble.innerHTML=formatMessage(event.error);state.liveReply='';const status=$('.activity-state',assistant);if(status)status.textContent=''}else if(event.type==='draft'){renderDraft(event.draft)}else if(event.type==='skill_offer'){showSkillOffer(assistant,event.request)}else{events.push(event);addActivity(assistant,[event],true)}};
@@ -107,8 +107,8 @@ function showSkillOffer(messageNode,request){
 $('#chat-form').addEventListener('submit',e=>{e.preventDefault();sendMessage($('#chat-input').value)});
 $('#chat-input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#chat-form').requestSubmit()}});
 $$('.suggestions button').forEach(button=>button.addEventListener('click',()=>sendMessage(button.dataset.prompt)));
-$$('.nav-item').forEach(button=>button.addEventListener('click',()=>selectView(button.dataset.view)));
-$('#clear-chat').addEventListener('click',async()=>{await api('/api/chat/clear',{method:'POST'});$('#messages').innerHTML='<div class="welcome"><div class="welcome-glyph">✳</div><span class="eyebrow">YOUR CAPABILITY WORKSPACE</span><h2>What are we working on?</h2><p>Ask a question, use live web search, or put an approved skill to work. When a reusable capability is missing, we’ll shape one together.</p><div class="suggestions"><button data-prompt="Search the web for the latest Python 3.14 release notes and cite your sources."><span>↗</span> Search current information</button><button data-prompt="Help me make a reusable capability for a task I do often."><span>✳</span> Build a reusable skill</button></div></div>';$$('.suggestions button').forEach(b=>b.onclick=()=>sendMessage(b.dataset.prompt));$('#draft-host').innerHTML=''});
+$$('.nav-item[data-view]').forEach(button=>button.addEventListener('click',()=>selectView(button.dataset.view)));
+$('#clear-chat').addEventListener('click',async()=>{await api('/api/foundry/chat/clear',{method:'POST'});$('#messages').innerHTML='<div class="welcome"><div class="welcome-glyph">✳</div><span class="eyebrow">SKILL MANAGEMENT WORKSPACE</span><h2>What capability should we build?</h2><p>Create a reusable skill, test and revise a draft, or manage approved capabilities. For one-off tasks, open Skill Runner.</p><div class="suggestions"><button data-prompt="Create a Python calculator skill with add, subtract, multiply, and divide."><span>✳</span> Build a calculator skill</button><button data-prompt="Show me the approved skills in the library."><span>⧉</span> Browse approved skills</button><a class="button" href="/runner">Open Skill Runner</a></div></div>';$$('.suggestions button').forEach(b=>b.onclick=()=>sendMessage(b.dataset.prompt));$('#draft-host').innerHTML=''});
 
 async function loadSkills() {
   try {state.skills=await api(`/api/skills?q=${encodeURIComponent($('#skill-search').value)}&status=${encodeURIComponent($('#status-filter').value)}`)}

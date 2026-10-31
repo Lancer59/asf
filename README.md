@@ -1,13 +1,15 @@
 # Agent Skill Foundry
 
-A local-first capability-management prototype with one Deep Agents conversation and a separate skill lifecycle library. The app keeps the current conversation in process memory only; SQLite and Deep Agents-compatible `SKILL.md` folders persist approved skill versions, audit events, validation output and execution outcomes.
+A local-first capability-management app with two workspaces: Skill Foundry for creating and governing reusable skills, and Skill Runner for ordinary tasks and approved-skill execution. The workspaces have separate pages and in-memory conversations while sharing model configuration, logs, SQLite lifecycle records, sandbox, and the approved `SKILL.md` folder.
+
+Technical documentation and change proposals are maintained in [`doc/`](doc/), including the [technical architecture](doc/technical_readme.md) and the [two-workspace change proposal](doc/change_proposal.md).
 
 ## Start on Windows
 
 Requires Python 3.12 or newer (the app also works on 3.13) and a network connection for package installation and hosted providers.
 
 ```powershell
-cd path\to\agent-skill-foundry\new
+cd path\to\asf
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -17,7 +19,7 @@ Copy-Item .env.example .env
 python run.py
 ```
 
-Open http://127.0.0.1:8000. The Skills library and chat UI work without credentials. Configure any OpenAI-compatible Chat Completions endpoint, API key, and model from Settings; credentials are stored in the local `.env`. Web search is optional and requires `TAVILY_API_KEY`. Never commit `.env`.
+Open http://127.0.0.1:8000 for Skill Foundry, or go directly to http://127.0.0.1:8000/runner for Skill Runner. Foundry manages reusable capabilities; Runner handles general tasks and uses approved skills when relevant. Configure an OpenAI-compatible Chat Completions endpoint, API key, and model from Foundry Settings; both workspaces share the selected profile. Web search is optional and requires `TAVILY_API_KEY`. Never commit `.env`.
 
 Settings can also switch the active provider to **Azure OpenAI (demo)**. The Azure endpoint, API key, API version, and deployment are stored separately from the normal OpenAI-compatible profile; switching back restores that profile. Azure uses `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION`, and `AZURE_OPENAI_DEPLOYMENT_NAME`. For newer Azure GPT deployments, the API version can be set to `v1`, which uses the Azure `/openai/v1` endpoint.
 
@@ -44,9 +46,9 @@ python -m pip install -r requirements.txt
 python -m pytest -q
 ```
 
-The tests cover provider configuration, chat and skill API behavior, draft review and approval, skill versioning and audit records, agent skill selection and progress labels, and Python sandbox outcomes. Tests use temporary SQLite databases and mock provider and Docker calls, so the default suite does not need API credentials, a running model endpoint, web search, or Docker Engine. The default route checks exercise the SSE response contract without opening a local socket server.
+The tests cover provider configuration, both workspace routes and isolated chat histories, role-specific tool boundaries, draft review and approval, skill versioning and audit records, agent skill selection and progress labels, and Python sandbox outcomes. Tests use temporary SQLite databases and mock provider and Docker calls, so the default suite does not need API credentials, a running model endpoint, web search, or Docker Engine. The default route checks exercise the SSE response contract without opening a local socket server.
 
-An opt-in live test sends a real request through ASF's configured agent and verifies that the model calls the approved-skills tool and receives a tool result. It can incur provider usage charges:
+Opt-in live tests send bounded requests through the configured agent and verify Foundry and Runner behaviors, including a greeting without tool calls and a real approved-skills tool call. They can incur provider usage charges:
 
 ```powershell
 $env:ASF_LIVE_TESTS = "1"
@@ -59,23 +61,29 @@ The live test reads credentials from the process environment or `.env`; it is sk
 
 ## Skill lifecycle
 
-Chat can use the live Tavily web search integration, use approved Deep Agent skills, or produce a draft for review. Skills describe reusable capabilities; city, URL, date, topic and similar request data belong in inputs. Drafts live in process memory and disappear after a restart. Edit the fields and complete Python source, run tests, inspect test output and use explicit acceptance to promote a passing draft. Approval writes a versioned `SKILL.md` directory and an audit/version record to `data/skills.sqlite`. Editing an approved skill creates a new version. Deprecated skills remain in the audit trail and are withheld from the agent.
+Foundry produces a reviewable candidate with a request-specific name, purpose, agent instructions, input definitions, expected output, tests, and (for code skills) complete Python source. Instructions are included in the approved `SKILL.md` together with explicit JSON input and output contracts so Runner can select a skill and supply the right values. Skill identifiers use lowercase letters/digits separated by single hyphens; the library keeps a readable display name.
+
+Python/hybrid candidates must expose a synchronous `run(inputs)` function. It may call helper functions, but it must return a JSON-serializable result; `main()`-only and print-only code does not count as a skill implementation. In Foundry, review and edit the candidate, provide useful test inputs, run the sandbox test, inspect the returned value and captured prints separately, then explicitly accept it. Python acceptance requires a passing test of the current source. Approval writes a versioned `SKILL.md` directory and audit/version records to `data/skills.sqlite`. Editing an approved skill creates a new version; deprecated skills remain in the audit trail and are hidden from Runner. Arithmetic and other reusable tasks are capabilities to create and approve as skills; Runner has no special built-in calculator.
+
+Neither workspace persists chat transcripts. Drafts and conversations live in process memory and disappear after a restart. Clear conversation removes only the current workspace's transcript.
 
 The lifecycle API is rooted at `/api/skills`; interactive API documentation is at `/docs`. Chat clearing only clears the in-memory transcript. Refreshing the page starts a new conversation. The app does not write transcripts to SQLite, browser storage, or cookies.
 
 ## Python skills and isolation
 
-Docker Desktop/Engine is required to test or run reviewed Python skill code. Every run uses a disposable Docker container with no network, a read-only source mount, memory/CPU/process limits, dropped Linux capabilities, no new privileges and a hard timeout. If Docker is missing, tests report that execution is disabled. The app never runs generated Python in its host process and never installs draft dependencies; generated skill dependencies are metadata only. Python code that needs external packages must use a separately reviewed/prebuilt worker image (the v1 runner intentionally ships only the Python base image).
+Docker Desktop/Engine is required to test or run reviewed Python skill code. Every run uses a disposable Docker container with no network, a read-only source mount, memory/CPU/process limits, dropped Linux capabilities, no new privileges and a hard timeout. If Docker is missing, tests report that execution is disabled and do not execute code. Python source is never run in the application process and draft dependencies are never installed; dependencies are metadata only. Skills needing external packages require a separately reviewed/prebuilt worker image (the current runner ships only the Python base image).
 
 ## Layout
 
 ```text
-new/
+asf/
   app.py, agent.py, skills.py, run.py
-  templates/index.html
-  static/app.js, styles.css
+  templates/index.html       # Skill Foundry
+  templates/runner.html      # Skill Runner
+  static/app.js, runner.js, styles.css
   skills/approved/<slug>/SKILL.md
   data/skills.sqlite
+  doc/technical_readme.md, change_proposal.md
 ```
 
 ## Current scope and evaluation
