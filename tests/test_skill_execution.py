@@ -137,6 +137,41 @@ def test_test_code_uses_default_network_and_restricted_docker_command(monkeypatc
     assert calls["kwargs"]["check"] is False
 
 
+def test_test_code_local_backend_runs_python_without_checking_docker(monkeypatch, isolated_project):
+    monkeypatch.setenv("ASF_SANDBOX_BACKEND", "local")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-skill")
+    calls = {}
+
+    def run(args, **kwargs):
+        calls.update(args=args, kwargs=kwargs)
+        return subprocess.CompletedProcess(args, 0, json.dumps({"result": {"ok": True}, "user_stdout": "local output\n", "user_stderr": ""}), "")
+
+    monkeypatch.setattr(skills.shutil, "which", lambda _: (_ for _ in ()).throw(AssertionError("Docker must not be queried in local mode")))
+    monkeypatch.setattr(skills.subprocess, "run", run)
+    result = skills.test_code("def run(inputs): return {'ok': True}", {"x": 1})
+
+    assert result["success"] is True
+    assert result["sandbox_backend"] == "local"
+    assert result["return_value"] == {"ok": True}
+    assert result["stdout"] == "local output\n"
+    assert calls["args"][:3] == [skills.sys.executable, "-I", "-c"]
+    assert calls["kwargs"]["cwd"].endswith("asf-skill-") is False
+    assert calls["kwargs"]["env"].get("PATH") == __import__("os").environ.get("PATH")
+    assert "OPENAI_API_KEY" not in calls["kwargs"]["env"]
+    assert calls["kwargs"]["timeout"] == 15
+
+
+def test_test_code_invalid_backend_fails_closed_without_execution(monkeypatch):
+    monkeypatch.setenv("ASF_SANDBOX_BACKEND", "something-else")
+    monkeypatch.setattr(skills.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not execute")))
+
+    result = skills.test_code("def run(inputs): return True", {})
+
+    assert result["success"] is False
+    assert result["status"] == "configuration_error"
+    assert "ASF_SANDBOX_BACKEND" in result["error"]
+
+
 def test_approved_skill_files_include_only_approved_markdown(monkeypatch, tmp_path):
     approved = tmp_path / "approved"
     folder = approved / "json-validator"

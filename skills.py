@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -24,6 +25,30 @@ APPROVED = ROOT / "skills" / "approved"
 DRAFTS: dict[str, dict] = {}
 MAX_OUTPUT = 20000
 logger = logging.getLogger("asf.skills")
+
+
+def sandbox_backend() -> str:
+    """Return the configured Python execution backend, defaulting to Docker."""
+    return os.getenv("ASF_SANDBOX_BACKEND", "docker").strip().lower()
+
+
+def sandbox_warning(backend: str | None = None) -> str:
+    backend = backend or sandbox_backend()
+    if backend == "local":
+        return "Local mode runs skill code in a child Python process with your Windows account's permissions. It is not isolated: code can access your files, programs, and network. Use only with code you trust."
+    if backend == "docker":
+        return "Docker mode runs skill code in a constrained container."
+    return "ASF_SANDBOX_BACKEND must be set to 'docker' or 'local'."
+
+
+def _local_runner_environment() -> dict[str, str]:
+    """Pass Windows runtime paths to local skills, but do not inherit API secrets."""
+    allowed = {
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
+        "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+        "PROGRAMFILES(X86)", "HOMEDRIVE", "HOMEPATH", "USERNAME", "USERDOMAIN",
+    }
+    return {key: value for key, value in os.environ.items() if key.upper() in allowed}
 
 
 def now() -> str:
@@ -192,18 +217,24 @@ def python_entrypoint_error(code: str) -> str | None:
 
 
 def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
-    """Run user-reviewed Python in Docker only; never execute in this process."""
+    """Run skill code through the configured Docker or local child-process backend."""
     if not code.strip():
         logger.warning("skill_test_rejected slug=%s reason=empty_source", slug or "-")
         return {"success": False, "error": "No Python source provided.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": ""}
     contract_error = python_entrypoint_error(code)
     if contract_error:
         return {"success": False, "status": "failed", "error": contract_error, "stdout": "", "stderr": "", "exit_code": 1, "duration_ms": 0, "source_hash": hashlib.sha256(code.encode()).hexdigest()}
-    docker = shutil.which("docker")
-    if not docker:
+    backend = sandbox_backend()
+    if backend not in {"docker", "local"}:
+        source_hash = hashlib.sha256(code.encode()).hexdigest()
+        return {"success": False, "status": "configuration_error", "sandbox_backend": backend,
+                "error": sandbox_warning(backend), "stdout": "", "stderr": "", "exit_code": None,
+                "duration_ms": 0, "source_hash": source_hash}
+    docker = shutil.which("docker") if backend == "docker" else None
+    if backend == "docker" and not docker:
         source_hash = hashlib.sha256(code.encode()).hexdigest()
         logger.warning("skill_test_unavailable slug=%s reason=docker_not_installed source_sha256=%s", slug or "-", source_hash)
-        return {"success": False, "status": "sandbox_unavailable", "error": "Docker is not installed. Install and start Docker Desktop to run Python skill tests; skill code is never executed directly on the host.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": source_hash}
+        return {"success": False, "status": "sandbox_unavailable", "sandbox_backend": backend, "error": "Docker is not installed. Install it or set ASF_SANDBOX_BACKEND=local to run skill code in a Windows child process.", "stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0, "source_hash": source_hash}
     source_hash = hashlib.sha256(code.encode()).hexdigest()
     start = time.monotonic()
     logger.info("skill_test_started slug=%s source_chars=%s source_sha256=%s", slug or "-", len(code), source_hash)
@@ -213,9 +244,10 @@ def test_code(code: str, inputs: dict, slug: str | None = None) -> dict:
         work = Path(folder)
         (work / "skill.py").write_text(code, encoding="utf-8")
         (work / "inputs.json").write_text(json.dumps(inputs), encoding="utf-8")
-        runner = """import contextlib, io, json, runpy
-ns = runpy.run_path('/work/skill.py')
-inputs = json.load(open('/work/inputs.json'))
+        runner = """import contextlib, io, json, runpy, sys
+ns = runpy.run_path(sys.argv[1])
+with open(sys.argv[2], encoding='utf-8') as input_file:
+    inputs = json.load(input_file)
 captured_out, captured_err = io.StringIO(), io.StringIO()
 try:
     run = ns.get('run')
@@ -232,15 +264,22 @@ except Exception as exc:
 print(json.dumps(envelope))"""
         # Omit --network so the container uses Docker's default network and
         # Python skills can call external APIs when Docker permits outbound access.
-        command = [docker, "run", "--rm", "--read-only", "--user", "65534:65534",
-                   "--memory", "128m", "--cpus", "0.5", "--pids-limit", "32", "--cap-drop", "ALL",
-                   "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
-                   "--mount", f"type=bind,src={work.resolve()},dst=/work,readonly", "python:3.12-alpine", "python", "-I", "-c", runner]
+        if backend == "docker":
+            command = [docker, "run", "--rm", "--read-only", "--user", "65534:65534",
+                       "--memory", "128m", "--cpus", "0.5", "--pids-limit", "32", "--cap-drop", "ALL",
+                       "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
+                       "--mount", f"type=bind,src={work.resolve()},dst=/work,readonly", "python:3.12-alpine", "python", "-I", "-c", runner,
+                       "/work/skill.py", "/work/inputs.json"]
+            run_kwargs = {"capture_output": True, "text": True, "timeout": 15, "check": False}
+        else:
+            command = [sys.executable, "-I", "-c", runner, str(work / "skill.py"), str(work / "inputs.json")]
+            run_kwargs = {"capture_output": True, "text": True, "timeout": 15, "check": False,
+                          "cwd": str(work), "env": _local_runner_environment()}
         try:
-            proc = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
+            proc = subprocess.run(command, **run_kwargs)
             stdout, stderr, code_exit = proc.stdout[:MAX_OUTPUT], proc.stderr[:MAX_OUTPUT], proc.returncode
             lower_error = stderr.lower()
-            engine_unavailable = code_exit != 0 and ("docker api" in lower_error or "dockerdesktoplinuxengine" in lower_error or "cannot connect to the docker daemon" in lower_error)
+            engine_unavailable = backend == "docker" and code_exit != 0 and ("docker api" in lower_error or "dockerdesktoplinuxengine" in lower_error or "cannot connect to the docker daemon" in lower_error)
             returned = None
             user_stdout = user_stderr = ""
             runtime_error = None
@@ -261,14 +300,14 @@ print(json.dumps(envelope))"""
                     returned = None
                     code_exit = 1
                     stderr = "Sandbox returned an invalid result envelope."
-            result = {"success": code_exit == 0, "status": "passed" if code_exit == 0 else "sandbox_unavailable" if engine_unavailable else "failed",
+            result = {"success": code_exit == 0, "status": "passed" if code_exit == 0 else "sandbox_unavailable" if engine_unavailable else "failed", "sandbox_backend": backend,
                       "inputs": inputs, "return_value": returned, "stdout": stdout, "stderr": stderr,
                       "user_stderr": user_stderr, "exit_code": code_exit,
                       "error": None if code_exit == 0 else ("The Docker command is installed, but its engine is not running. Start Docker Desktop, wait until its engine is ready, then run the test again. The skill code was not executed." if engine_unavailable else (stderr or f"Sandbox exited with status {code_exit}")),
                       "duration_ms": int((time.monotonic()-start)*1000), "source_hash": source_hash}
         except subprocess.TimeoutExpired as exc:
-            result = {"success": False, "status": "timeout", "stdout": (exc.stdout or "")[:MAX_OUTPUT], "stderr": (exc.stderr or "")[:MAX_OUTPUT],
-                      "exit_code": None, "error": "Sandbox timed out after 15 seconds.", "duration_ms": 15000, "source_hash": source_hash}
+            result = {"success": False, "status": "timeout", "sandbox_backend": backend, "stdout": (exc.stdout or "")[:MAX_OUTPUT], "stderr": (exc.stderr or "")[:MAX_OUTPUT],
+                      "exit_code": None, "error": f"{'Local runner' if backend == 'local' else 'Sandbox'} timed out after 15 seconds.", "duration_ms": 15000, "source_hash": source_hash}
     with connect() as conn:
         conn.execute("INSERT INTO executions(slug,source_hash,success,output,error,duration_ms,created_at) VALUES(?,?,?,?,?,?,?)",
                      (slug, source_hash, int(result["success"]), result["stdout"], result["error"], result["duration_ms"], now()))
@@ -276,8 +315,8 @@ print(json.dumps(envelope))"""
             conn.execute("UPDATE skills SET last_test=?,last_execution=? WHERE slug=?", (json.dumps(result), "passed" if result["success"] else "failed", slug))
     log_method = logger.info if result["success"] else logger.warning
     log_method(
-        "skill_test_finished slug=%s status=%s success=%s duration_ms=%s source_sha256=%s",
-        slug or "-", result.get("status", "failed"), result["success"], result["duration_ms"], source_hash,
+        "skill_test_finished slug=%s backend=%s status=%s success=%s duration_ms=%s source_sha256=%s",
+        slug or "-", backend, result.get("status", "failed"), result["success"], result["duration_ms"], source_hash,
     )
     return result
 

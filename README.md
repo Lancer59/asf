@@ -73,7 +73,7 @@ The lifecycle API is rooted at `/api/skills`; interactive API documentation is a
 
 ## Python skills and isolation
 
-Docker Desktop/Engine is required to test or run reviewed Python skill code. Every run uses a disposable Docker container on Docker's default network, so Python skills can make outbound API calls when Docker and the host permit them. The container also has a read-only source mount, memory/CPU/process limits, dropped Linux capabilities, no new privileges and a hard timeout. If Docker is missing, tests report that execution is disabled and do not execute code. Python source is never run in the application process and draft dependencies are not installed; dependencies are metadata only. Prefer Python's standard library for HTTP calls, or use a separately reviewed/prebuilt worker image for external packages.
+Python skill execution is configured with `ASF_SANDBOX_BACKEND` in `.env`. Set it to `docker` (default) to run in a constrained container on Docker's default network, or `local` to run in a separate Python process on your Windows laptop. Local mode can use installed Windows programs such as PowerShell and Windows APIs, and Python skills can make outbound API calls. It is not isolated: skill code has the file, program, and network permissions of your Windows account. Use local mode only for code you trust. Restart ASF after changing the setting. Both modes enforce a 15-second timeout; Docker also applies container resource and filesystem restrictions. Skill dependencies are not installed automatically, so the selected Python environment must already provide any imported packages.
 
 ## Layout
 

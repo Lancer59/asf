@@ -301,6 +301,8 @@ def configuration():
         "openai_compatible": compatible,
         "models": llm_provider.model_catalog(),
         "search_configured": bool(os.getenv("TAVILY_API_KEY")),
+        "sandbox_backend": skills.sandbox_backend(),
+        "sandbox_warning": skills.sandbox_warning(),
         "docker_available": bool(__import__("shutil").which("docker")),
     }
 

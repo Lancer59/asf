@@ -10,12 +10,15 @@ def test_home_and_config_report_unconfigured_provider(client, monkeypatch):
     monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
     monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT_NAME", raising=False)
     monkeypatch.setattr("shutil.which", lambda _: None)
+    monkeypatch.setenv("ASF_SANDBOX_BACKEND", "local")
 
     assert client.get("/").status_code == 200
     config = client.get("/api/config").json()
     assert config["llm_configured"] is False
     assert config["search_configured"] is False
     assert config["docker_available"] is False
+    assert config["sandbox_backend"] == "local"
+    assert "not isolated" in config["sandbox_warning"]
 
 
 def test_provider_config_validation_and_save(client, monkeypatch, isolated_project):

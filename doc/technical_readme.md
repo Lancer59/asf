@@ -11,7 +11,7 @@ The system has four main parts:
 1. A browser UI served by FastAPI, using static HTML, CSS, and JavaScript.
 2. A role-aware agent adapter that configures LangChain `ChatOpenAI` and Deep Agents, exposing narrowly scoped lifecycle tools to Foundry and task/approved-skill tools to Runner.
 3. A skill lifecycle module backed by SQLite and approved-skill files on disk.
-4. A Docker-based runner for Python skill source. Draft code is not run in the web server process.
+4. A configurable Docker or local child-process runner for Python skill source. Draft code is not run in the web server process.
 
 ```mermaid
 flowchart TD
@@ -25,7 +25,7 @@ flowchart TD
     Search[Tavily Search<br/>optional]
     DB[(SQLite<br/>skills, versions, audit, executions)]
     Files[(Approved skill folders<br/>SKILL.md and skill.py)]
-    Docker[Docker Engine<br/>isolated Python execution]
+    Sandbox[Docker or local Python<br/>skill execution]
 
     FoundryUI <-->|JSON / SSE| API
     RunnerUI <-->|JSON / SSE| API
@@ -38,8 +38,8 @@ flowchart TD
     API -->|draft, review, library| Skills
     Skills <--> DB
     Skills <--> Files
-    Skills -->|source + JSON inputs| Docker
-    Docker -->|return value, stdout, stderr, status| Skills
+    Skills -->|source + JSON inputs| Sandbox
+    Sandbox -->|return value, stdout, stderr, status| Skills
 ```
 
 ### Runtime topology
@@ -48,7 +48,7 @@ flowchart TD
 - Foundry and Runner conversation state are separate Python process globals. Foundry tracks one active skill per conversation: one clarification round is allowed, then the draft occupies the right-hand review workspace. Starting another skill is blocked until Clear conversation removes the unapproved draft and resets session state. Approved skills remain in the library. State is local to the process and is not coordinated between multiple workers.
 - SQLite and skill files are local persistent state under the repository by default.
 - The browser makes same-origin requests to the FastAPI server. There is no separate frontend build or API gateway.
-- Provider requests leave the machine and go to the configured endpoint. Tavily requests leave the machine when search is enabled. Skill source is mounted into the local Docker container.
+- Provider requests leave the machine and go to the configured endpoint. Tavily requests leave the machine when search is enabled. Skill source is mounted read-only into Docker, or passed to a local child Python process according to ASF_SANDBOX_BACKEND.
 
 This topology is designed for a single local user. It currently has no authentication, authorization, tenant isolation, distributed state, or multi-worker coordination.
 
@@ -59,7 +59,7 @@ This topology is designed for a single local user. It currently has no authentic
 | `run.py` | Changes the working directory to the project root, checks core imports, loads `.env`, and starts Uvicorn. |
 | `app.py` | FastAPI app, provider configuration, workspace pages and role-specific chat SSE/clear routes, skill and draft routes, process-local conversation histories. |
 | `agent.py` | Shared model setup plus Foundry/Runner-specific prompts and tools, approved-skill execution adapter, model event translation. |
-| `skills.py` | SQLite setup and queries, draft creation, promotion/versioning, audit history, approved skill filesystem, Docker execution. |
+| `skills.py` | SQLite setup and queries, draft creation, promotion/versioning, audit history, approved skill filesystem, configurable sandbox execution. |
 | `templates/index.html` | Skill Foundry UI shell and dialogs. |
 | `templates/runner.html` | Independent Skill Runner UI shell. |
 | `static/app.js` | Foundry API client, message rendering, SSE reader, activity display, skill library and review interactions. |
@@ -82,7 +82,7 @@ This topology is designed for a single local user. It currently has no authentic
 - **LangChain Tavily** for optional live web search.
 - **SQLite** via Python's standard library for persistence.
 - **PyYAML** for Agent Skills frontmatter serialization.
-- **Docker Engine** for optional isolated execution of Python skills.
+- **Docker Engine** when ASF_SANDBOX_BACKEND=docker (default), or a local Python runtime when ASF_SANDBOX_BACKEND=local.
 - **pytest** and **httpx** are in the development dependency set; requirements installation includes them.
 
 `requirements.in` is the manually maintained dependency input, while `requirements.txt` is the pip install file. `pyproject.toml` declares application dependencies and the `dev` dependency group.
@@ -119,6 +119,7 @@ This topology is designed for a single local user. It currently has no authentic
 | `PORT` | Local HTTP port. | `8000`. |
 | `LOG_LEVEL` | Minimum ASF log level. | `INFO`; use `DEBUG` for more event metadata. |
 | `ASF_LOG_FILE` | Persistent log destination. | `data/logs/asf.log`; empty disables file logging but keeps console logs. |
+| `ASF_SANDBOX_BACKEND` | Python skill execution backend: `docker` or `local`. | Defaults to Docker. Local runs as a child process with the current Windows account permissions and is not isolated. |
 
 The Settings endpoint accepts a provider type, endpoint, API key, and model/deployment name. It requires an `http://` or `https://` URL, non-empty model, and key (the active provider's existing key may be reused if the submitted key is blank). OpenAI-compatible settings write `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `LLM_MODEL`; Azure settings write the separate `AZURE_OPENAI_*` variables. Selecting one profile does not overwrite the other profile's credentials. Both are saved in the project `.env` and take effect in the running process immediately. The endpoint does not make a test request to verify that credentials, endpoint, API version, and deployment work together.
 
@@ -186,7 +187,7 @@ Foundry session state allows one clarification exchange: if the agent asks a que
 4. Registers workspace-specific tools. Foundry can list approved skill metadata and prepare a draft; Runner can list and execute approved skills. Either role gets web search only when configured.
 5. Supplies approved skill directories and file contents to Runner only. Foundry does not receive skill execution tools or the approved-skill filesystem.
 
-Foundry's system prompt focuses on reusable skill management, direct greetings, and proposal creation for explicit reusable-skill requests; it does not handle ordinary task execution. The proposal tool's model-facing schema keeps `proposal` as a JSON object, then validates its contents inside the tool with the stricter Pydantic `SkillProposal` model. Optional descriptive metadata (`expected_output`, `tools`, and `scope_note`) has safe defaults; tool metadata accepts JSON values because it is descriptive and is not executed. This avoids rejecting an otherwise usable draft over omitted or differently shaped optional metadata. No serialized JSON text is requested. Python source errors receive one focused structured repair using compiler and contract diagnostics, without regenerating the rest of the proposal. Python/hybrid proposals are checked for syntax, a synchronous returning `run(inputs)` entry point, nonempty input contracts, and tests whose input objects match declared names and JSON types; the expected value is described as the actual JSON return shape, not prose or a schema. Tool input errors and repeated invalid proposals are surfaced in the activity stream; retrying is bounded so a malformed proposal cannot silently loop until graph recursion failure. When the model deliberately narrows a broad request, its scope note appears in the review card; there is no keyword-count complexity gate. Python skills run on Docker's default network and can make outbound HTTP/API calls when the host and Docker daemon permit them. Third-party dependencies remain uninstalled; proposals are directed to standard-library implementations unless the sandbox image is extended. If a proposal remains invalid, the agent explains the issue and asks the user to narrow scope rather than claim a draft was created. Python/hybrid source may call helpers and must return JSON-serializable output; generic names and `main()`/print-only code are explicitly excluded. Runner's prompt handles tasks, asks it to greet without tools, search approved skills only for plausible matches, and ground claims of execution in returned tool results. Both prompts describe tool results and skill instructions as untrusted data. Tool registration enforces the main lifecycle boundaries independently of prompt wording.
+Foundry's system prompt focuses on reusable skill management, direct greetings, and proposal creation for explicit reusable-skill requests; it does not handle ordinary task execution. The proposal tool's model-facing schema keeps `proposal` as a JSON object, then validates its contents inside the tool with the stricter Pydantic `SkillProposal` model. Optional descriptive metadata (`expected_output`, `tools`, and `scope_note`) has safe defaults; tool metadata accepts JSON values because it is descriptive and is not executed. This avoids rejecting an otherwise usable draft over omitted or differently shaped optional metadata. No serialized JSON text is requested. Python source errors receive one focused structured repair using compiler and contract diagnostics, without regenerating the rest of the proposal. Python/hybrid proposals are checked for syntax, a synchronous returning `run(inputs)` entry point, nonempty input contracts, and tests whose input objects match declared names and JSON types; the expected value is described as the actual JSON return shape, not prose or a schema. Tool input errors and repeated invalid proposals are surfaced in the activity stream; retrying is bounded so a malformed proposal cannot silently loop until graph recursion failure. When the model deliberately narrows a broad request, its scope note appears in the review card; there is no keyword-count complexity gate. Python skills can make outbound HTTP/API calls in either backend when networking is available. Docker mode uses Docker's default network. Local mode has the host account's network access and uses packages already installed in the application's Python environment. Third-party dependencies are not installed automatically. If a proposal remains invalid, the agent explains the issue and asks the user to narrow scope rather than claim a draft was created. Python/hybrid source may call helpers and must return JSON-serializable output; generic names and `main()`/print-only code are explicitly excluded. Runner's prompt handles tasks, asks it to greet without tools, search approved skills only for plausible matches, and ground claims of execution in returned tool results. Both prompts describe tool results and skill instructions as untrusted data. Tool registration enforces the main lifecycle boundaries independently of prompt wording.
 
 Foundry and Runner each keep a volatile in-memory history, bounded to 20 message objects per workspace. `_compact_history` passes up to four recent messages to the agent and truncates individual content strings beyond 1,600 characters. The current request is separately limited to 6,000 characters before it is passed to the agent. `/api/foundry/chat/clear` and `/api/runner/chat/clear` clear only their own histories. The legacy `/api/chat/clear` alias clears Runner.
 
@@ -228,7 +229,7 @@ Direct draft API calls have defaults and carry the original task as a sample inp
 ### Review and promotion gates
 
 1. The user may edit candidate fields and test data.
-2. Testing a Python/hybrid draft calls the Docker runner and appends the result and the source snapshot to `attempts`.
+2. Testing a Python/hybrid draft calls the configured sandbox runner and appends the result and the source snapshot to `attempts`.
 3. Accepting a Python/hybrid draft requires a successful latest test whose recorded source text matches the current code. Changing code after testing makes that attempt stale.
 4. Instruction-only skills do not require Python execution.
 5. Promotion writes a spec-style `SKILL.md`, optional `skill.py`, and a SQLite row. It increments the existing version if the same slug is already present, adds a version-history row, and writes an approval audit record.
@@ -255,19 +256,13 @@ Promotion writes the approved Markdown/code files before persisting SQLite recor
 
 ## 7. Python skill sandbox
 
-### Execution protocol
+`ASF_SANDBOX_BACKEND` selects the execution backend (`docker` or `local`; default `docker`). Both modes run skill source in a child process, invoke the synchronous `run(inputs)` entry point, capture its return value and prints, enforce a 15-second timeout, validate a JSON-serializable result, hash the source, and record attempted executions in SQLite.
 
-`skills.test_code(code, inputs, slug)`:
+Docker mode writes the source and inputs under `data/sandbox`, then invokes `python:3.12-alpine` with Docker's default network, a read-only root/source mount, non-root UID, memory/CPU/process limits, dropped Linux capabilities, no-new-privileges, and a restricted temporary filesystem. Docker Desktop/Engine must be installed and available; the image must be present or obtainable by Docker.
 
-1. Rejects empty source. If Docker is not installed, reports `sandbox_unavailable` without executing code on the host.
-2. Creates a temporary directory under `data/sandbox`, writes `skill.py` and `inputs.json`, and passes a small runner program to the container.
-3. Invokes `docker run` with the `python:3.12-alpine` image and Docker's default network, plus a read-only root filesystem, non-root UID, memory/CPU/process limits, dropped Linux capabilities, no-new-privileges, a restricted `/tmp`, and a read-only bind mount of the temporary work directory.
-4. Runs Python isolated mode (`-I`). The host checks syntax and requires a synchronous `run(inputs)` entry point. The container imports the skill file with `runpy`, loads JSON input, invokes `run(inputs)`, requires a non-`None` JSON-serializable return value, and captures user stdout and stderr separately from the runner envelope. `main()` and print-only code are rejected as skill entry points.
-5. Enforces a 15-second host-side subprocess timeout and clips captured output to `MAX_OUTPUT` (20,000 characters).
-6. Parses the runner JSON envelope, distinguishes the user's return value/prints from Docker/runner errors, hashes the source, and records the execution in SQLite when Docker invocation was attempted.
+Local mode starts the selected application Python executable with isolated Python startup (`-I`) in a child process on the Windows host. It supports installed Windows programs such as PowerShell and Windows APIs, plus packages already installed in that Python environment. The child receives a limited set of Windows runtime environment variables rather than inherited API credentials. It still runs with the current Windows account's file, program, and network permissions and is not a security sandbox. Use it only for code you trust. Set `ASF_SANDBOX_BACKEND=local` in `.env` and restart ASF to use it. The UI identifies the active mode and warns when local mode is selected.
 
-The container uses Docker's default network, which permits outbound requests if Docker Desktop, host firewall rules, and network policy allow them. Python skills can therefore contact external APIs; they must still validate user-supplied URLs and avoid exposing credentials in outputs. Docker must already be installed and its daemon available. The base image must be present locally or Docker must be able to obtain it; image acquisition is managed by Docker outside the isolated container. The sandbox is a useful isolation boundary for this local prototype, but it has not undergone a formal security review and should not be treated as a hardened multi-tenant code execution service.
-
+Both backends can make outbound network requests when host policy permits them. User-provided URLs still need validation, and skills should not return secrets. Neither backend installs proposal dependencies automatically. Docker provides stronger process/filesystem restrictions but has not had a formal security review; local mode prioritizes host compatibility over isolation.
 ## 8. HTTP API surface
 
 Payload models are declared in `app.py`. FastAPI/Pydantic performs JSON parsing and basic type validation; business-level checks are described below.
@@ -277,7 +272,7 @@ Payload models are declared in `app.py`. FastAPI/Pydantic performs JSON parsing 
 | `GET /` | Render the single-page app shell. |
 | `GET /foundry` | Render Skill Foundry; same page as `/`. |
 | `GET /runner` | Render the separate Skill Runner page. |
-| `GET /api/config` | Return provider/search configured flags, endpoint/model display values, and Docker availability. Does not reveal keys. |
+| `GET /api/config` | Return provider/search configured flags, endpoint/model display values, selected sandbox backend/warning, and Docker availability. Does not reveal keys. |
 | `PUT /api/config/provider` | Validate and persist endpoint URL, API key, and model. |
 | `PUT /api/config/model-profile` | Update an existing custom `ASF_MODELS` entry and optionally its separately stored API key. |
 | `POST /api/config/model-profile` | Add a custom OpenAI-compatible or Azure profile to `ASF_MODELS`. |
@@ -338,7 +333,7 @@ Current coverage is organized as follows:
 - `tests/test_agent.py`: history compaction, task/skill intent detection, derived skill names, complete JSON proposal transfer, callable JSON skill source, approved-skill execution delegation, progress labels, and OpenAI-compatible/Azure dated/v1 model setup.
 - `tests/test_app_routes.py`: OpenAI-compatible and Azure profile validation/persistence, separate credential preservation, home/config state, chat request validation/SSE response contract/history clearing, skill route errors, draft edit/test/review flows and acceptance gates, plus agent revision proposal without persistence and preserved skill identity.
 - `tests/test_skill_lifecycle.py`: proposal defaults, SQLite promotion, files/frontmatter, search, version history, failed/pass promotion, update validation with selected inputs, deprecation, audit details.
-- `tests/test_skill_execution.py`: return values and captured prints, rejection of `main()`/print-only/`None`-returning code, empty/no-Docker/daemon-unavailable states, runtime exceptions, timeout, malformed runner envelope, restrictive Docker arguments, approved Markdown exposure, slug/frontmatter naming.
+- `tests/test_skill_execution.py`: return values and captured prints, rejection of `main()`/print-only/`None`-returning code, empty/no-Docker/daemon-unavailable states, local backend execution, and invalid backend configuration, runtime exceptions, timeout, malformed runner envelope, restrictive Docker arguments, approved Markdown exposure, slug/frontmatter naming.
 - `tests/test_observability.py`: file logging format, request ID correlation, response header injection, lifecycle event coverage, and query-string exclusion.
 - `tests/test_log_dashboard.py`: newest-first log selection, generated-data warning and controls, reverse chronological parsing, full-file AI and per-tool metrics with truncated display rows, and rejection of unlisted paths.
 - `tests/conftest.py`: temporary project/database isolation and a direct endpoint-function adapter.
@@ -349,11 +344,11 @@ The default suite mocks provider and Docker subprocess boundaries; it requires n
 ## 11. Security, privacy, and operational boundaries
 
 - **Local credentials:** `.env` contains secrets and is ignored by Git. Provider keys are not returned by `/api/config`. The Settings form writes key material in plain text to `.env`; filesystem protections are therefore important.
-- **Network egress:** Model calls, optional Tavily searches, and Python skills can contact external services. Python containers use Docker's default network; outbound access depends on local Docker and host network policy.
+- **Network egress:** Model calls, optional Tavily searches, and Python skills can contact external services. Docker skills use Docker's default network; local skills use host networking. Outbound access depends on host network policy.
 - **Local-only by default:** Uvicorn binds to `127.0.0.1`. Do not expose the application on a shared network without authentication, TLS, request protections, rate limits, and an explicit threat review.
 - **Process state:** Chat messages and drafts are global and volatile. Multiple users or Uvicorn workers would have isolated but unsynchronized state.
-- **Skill trust:** Only reviewed/approved skill Markdown is loaded. Skill instructions and tool results remain untrusted input to the model. Python source runs only through Docker.
-- **Audit scope:** Lifecycle changes and sandbox executions that reach Docker are recorded; provider prompts/responses and chat transcripts are not persisted to SQLite.
+- **Skill trust:** Only reviewed/approved skill Markdown is loaded. Skill instructions and tool results remain untrusted input to the model. Python source runs through the configured backend. Docker mode has container restrictions; local mode runs with the current user's permissions and is not isolated.
+- **Audit scope:** Lifecycle changes and sandbox executions attempted through either backend are recorded; provider prompts/responses and chat transcripts are not persisted to SQLite.
 - **Retention:** SQLite records and approved skill files persist until manually removed. There is no retention or deletion policy interface yet.
 - **Error boundaries:** Provider/model setup and invocation errors are surfaced to the chat stream. A provider can still reject unsupported model features or return incompatible payloads.
 
@@ -379,6 +374,6 @@ The current implementation intentionally favors a small, inspectable local appli
 | Search | Optional Tavily tool. | Current web research when configured; external key and network dependency. |
 | Skill storage | SQLite records plus Agent Skills Markdown/code folders. | Human-readable instructions and queryable history; filesystem/DB consistency must be managed. |
 | Chat/draft persistence | Process memory. | No transcript retention and easy local operation; restart loss and no session isolation. |
-| Python execution | Docker container with default network, constrained mounts/resources. | Enables API integrations while keeping source off the host process; outbound access is host-dependent and the sandbox is not fully hardened. |
+| Python execution | Docker container by default, or a local child Python process when configured. | Docker applies container restrictions. Local mode supports Windows APIs and installed programs but runs with the current account permissions and is not isolated. |
 | Retrieval | Metadata and substring matching. | Transparent and dependency-light; weaker recall/precision than semantic retrieval. |
 

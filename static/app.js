@@ -302,7 +302,9 @@ function showDraftCritique(payload){
 
 async function config() {
   const c=await api('/api/config');
-  $('#system-state').textContent=c.llm_configured?`Model ready · ${c.provider_type==='azure_openai'?'Azure demo · ':''}${c.model}`:'Model setup needed';
+  const sandboxLabel=c.sandbox_backend==='local'?'Local Python · not isolated':c.sandbox_backend==='docker'?'Docker sandbox':`Sandbox config error · ${c.sandbox_backend}`;
+  $('#system-state').textContent=`${c.llm_configured?`Model ready · ${c.provider_type==='azure_openai'?'Azure demo · ':''}${c.model}`:'Model setup needed'} · ${sandboxLabel}`;
+  $('#system-state').title=c.sandbox_warning||'';
   $('#config-banner').classList.toggle('hidden',c.llm_configured);
   $('#config-copy').textContent='Choose an OpenAI-compatible endpoint or Azure OpenAI, then provide its key and model deployment.';
   state.providerProfiles={openai_compatible:c.openai_compatible,azure_openai:c.azure_openai};
